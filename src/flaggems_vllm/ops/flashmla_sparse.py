@@ -393,7 +393,7 @@ if HAS_TLE_FLASHMLA_SPARSE:
         tle.gpu.copy(q_desc, q_write_slot.sQ_l, [BH, DPH], [output_row, 0])
         tle.gpu.copy(q_desc, q_write_slot.sQ_r, [BH, DPH], [output_row, DPH])
         if HAVE_TAIL:
-            tle.gpu.copy(tq_desc, q_write_slot.sQ_tail, [BH, TDP], [output_row, 0])
+            tle.gpu.copy(tq_desc, q_write_slot.sQ_tail, [BH, TDP], [output_row, D])
         q_writer.commit(0)
 
         q_slot = q_reader.wait(0).slot
@@ -714,8 +714,10 @@ if HAS_TLE_FLASHMLA_SPARSE:
         stride_lm = H
         stride_mm = H
 
-        i_sq = tl.program_id(0)
-        i_grh = tl.program_id(1)
+        pid = tl.program_id(0)
+        programs_per_q: tl.constexpr = VG * RH
+        i_sq = pid // programs_per_q
+        i_grh = pid % programs_per_q
         i_g = i_grh // RH
         i_rh = i_grh % RH
         h_base = i_rh * BH
@@ -726,7 +728,8 @@ if HAS_TLE_FLASHMLA_SPARSE:
         kv_base = kv + i_g64 * stride_kvg
         tkv_base = kv_base + D
         t_base = indices + i_sq64 * stride_tm + i_g64 * stride_tg
-        topk_len_ptr = topk_length + i_sq64
+        topk_len_ptr = topk_length + i_sq64 if HAVE_TOPK_LENGTH else indices
+        attn_sink_base = attn_sink if HAVE_ATTN_SINK else max_logits
         max_logits_base = max_logits + i_sq64 * stride_mm + q_head_base64
         l_base = lse + i_sq64 * stride_lm + q_head_base64
         q_row = i_sq * H + q_head_base
@@ -927,7 +930,7 @@ if HAS_TLE_FLASHMLA_SPARSE:
                         q_row,
                         h_base,
                         topk_len_ptr,
-                        attn_sink,
+                        attn_sink_base,
                         log_scale,
                         D,
                         TD,
@@ -965,7 +968,7 @@ if HAS_TLE_FLASHMLA_SPARSE:
                         l_base,
                         h_base,
                         topk_len_ptr,
-                        attn_sink,
+                        attn_sink_base,
                         log_scale,
                         D,
                         TD,
@@ -1050,144 +1053,6 @@ def _set_triton_descriptor_allocator(device: torch.device) -> None:
     triton.set_allocator(alloc_fn)
 
 
-def _flash_mla_sparse_fwd_tle(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    sm_scale: float,
-    output: torch.Tensor,
-    max_logits: torch.Tensor,
-    lse: torch.Tensor,
-    d_v: int = 512,
-    attn_sink: Optional[torch.Tensor] = None,
-    topk_length: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from triton.tools.tensor_descriptor import TensorDescriptor
-
-    _set_triton_descriptor_allocator(q.device)
-    SQ, HQ, DQK = q.shape
-    SKV, HKV, _ = kv.shape
-    _, _, TOPK = indices.shape
-    D = d_v
-    TD = DQK - D
-    DP = triton.next_power_of_2(D)
-    HAVE_TAIL = TD > 0
-    TDP = triton.next_power_of_2(TD) if HAVE_TAIL else 1
-    G = HQ // HKV
-    BH = TLE_FLASHMLA_PREFILL_BH
-    RH = G // BH
-    BK = TLE_FLASHMLA_PREFILL_BK
-
-    attn_sink_arg = (
-        attn_sink
-        if attn_sink is not None
-        else torch.empty((1,), device=q.device, dtype=torch.float32)
-    )
-    topk_length_arg = topk_length if topk_length is not None else indices
-    q_flat = q.reshape(SQ * HQ, DQK)
-    output_flat = output.reshape(SQ * HQ, D)
-    q_desc = TensorDescriptor(
-        q_flat, shape=[SQ * HQ, D], strides=[DQK, 1], block_shape=[BH, DP // 2]
-    )
-    if HAVE_TAIL:
-        q_tail = q_flat[:, D:]
-        tq_desc = TensorDescriptor(
-            q_tail, shape=[SQ * HQ, TD], strides=[DQK, 1], block_shape=[BH, TDP]
-        )
-    else:
-        tq_desc = q_desc
-    output_desc = TensorDescriptor(
-        output_flat, shape=[SQ * HQ, D], strides=[D, 1], block_shape=[BH, DP // 2]
-    )
-
-    grid = (SQ, HKV * RH)
-    _tle_flashmla_prefill_fwd[grid](
-        q_desc,
-        tq_desc,
-        output_desc,
-        kv,
-        indices,
-        attn_sink_arg,
-        topk_length_arg,
-        sm_scale,
-        output,
-        max_logits,
-        lse,
-        SQ,
-        HQ,
-        DQK,
-        SKV,
-        TOPK,
-        attn_sink is not None,
-        topk_length is not None,
-        D,
-        TD,
-        DP,
-        TDP,
-        G,
-        HKV,
-        RH,
-        HAVE_TAIL,
-        BK,
-        BH,
-        TLE_FLASHMLA_PREFILL_PAIR_BLOCKS,
-        num_warps=TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS,
-        num_stages=1,
-    )
-    return output, max_logits, lse
-
-
-def _flash_mla_sparse_fwd_triton(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    sm_scale: float,
-    output: torch.Tensor,
-    max_logits: torch.Tensor,
-    lse: torch.Tensor,
-    d_v: int = 512,
-    attn_sink: Optional[torch.Tensor] = None,
-    topk_length: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    SQ, HQ, DQK = q.shape
-    SKV, _, _ = kv.shape
-    _, _, TOPK = indices.shape
-    _ = d_v
-
-    def grid(META):
-        return (triton.cdiv(HQ, META["BH"]) * SQ,)
-
-    triton_flash_mla_sparse_fwd[grid](
-        q,
-        kv,
-        indices,
-        attn_sink,
-        topk_length,
-        sm_scale,
-        output,
-        max_logits,
-        lse,
-        q.stride(1),
-        q.stride(0),
-        kv.stride(1),
-        kv.stride(0),
-        indices.stride(1),
-        indices.stride(0),
-        output.stride(1),
-        output.stride(0),
-        max_logits.stride(0),
-        lse.stride(0),
-        SQ,
-        HQ,
-        DQK,
-        SKV,
-        TOPK,
-        attn_sink is not None,
-        topk_length is not None,
-    )
-    return output, max_logits, lse
-
-
 def flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1254,32 +1119,99 @@ def flash_mla_sparse_fwd(
     assert DQK == 576 or DQK == 512, "Unsupported d_qk"
 
     _ = SKV
+    D = DV
+    TD = DQK - D
+    DP = triton.next_power_of_2(D)
+    HAVE_TAIL = TD > 0
+    TDP = triton.next_power_of_2(TD) if HAVE_TAIL else 1
+    G = HQ // HKV
+    BH = TLE_FLASHMLA_PREFILL_BH
+    RH = G // BH
+    BK = TLE_FLASHMLA_PREFILL_BK
     output = torch.empty((SQ, HQ, DV), device=q.device, dtype=q.dtype)
     max_logits = torch.empty((SQ, HQ), device=q.device, dtype=torch.float32)
     lse = torch.empty((SQ, HQ), device=q.device, dtype=torch.float32)
+
+    def triton_grid(META):
+        return (triton.cdiv(HQ, META["BH"]) * SQ,)
+
     if _can_use_tle_flash_mla_sparse_fwd(q, kv, indices, d_v, topk_length):
-        return _flash_mla_sparse_fwd_tle(
-            q,
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        _set_triton_descriptor_allocator(q.device)
+        q_desc = TensorDescriptor(
+            q, shape=[SQ * HQ, DQK], strides=[DQK, 1], block_shape=[BH, DP // 2]
+        )
+        if HAVE_TAIL:
+            tq_desc = TensorDescriptor(
+                q, shape=[SQ * HQ, DQK], strides=[DQK, 1], block_shape=[BH, TDP]
+            )
+        else:
+            tq_desc = q_desc
+        output_desc = TensorDescriptor(
+            output, shape=[SQ * HQ, D], strides=[D, 1], block_shape=[BH, DP // 2]
+        )
+        _tle_flashmla_prefill_fwd[triton_grid](
+            q_desc,
+            tq_desc,
+            output_desc,
             kv,
             indices,
+            attn_sink,
+            topk_length,
             sm_scale,
             output,
             max_logits,
             lse,
-            d_v,
-            attn_sink,
-            topk_length,
+            SQ,
+            HQ,
+            DQK,
+            SKV,
+            TOPK,
+            attn_sink is not None,
+            topk_length is not None,
+            D,
+            TD,
+            DP,
+            TDP,
+            G,
+            HKV,
+            RH,
+            HAVE_TAIL,
+            BK,
+            BH,
+            TLE_FLASHMLA_PREFILL_PAIR_BLOCKS,
+            num_warps=TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS,
+            num_stages=1,
         )
+        return output, max_logits, lse
 
-    return _flash_mla_sparse_fwd_triton(
+    triton_flash_mla_sparse_fwd[triton_grid](
         q,
         kv,
         indices,
+        attn_sink,
+        topk_length,
         sm_scale,
         output,
         max_logits,
         lse,
-        d_v,
-        attn_sink,
-        topk_length,
+        q.stride(1),
+        q.stride(0),
+        kv.stride(1),
+        kv.stride(0),
+        indices.stride(1),
+        indices.stride(0),
+        output.stride(1),
+        output.stride(0),
+        max_logits.stride(0),
+        lse.stride(0),
+        SQ,
+        HQ,
+        DQK,
+        SKV,
+        TOPK,
+        attn_sink is not None,
+        topk_length is not None,
     )
+    return output, max_logits, lse
