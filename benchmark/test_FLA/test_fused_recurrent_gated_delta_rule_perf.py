@@ -155,10 +155,10 @@ class FusedRecurrentGatedDeltaRuleBenchmark(Benchmark):
 def _torch_op_wrapper(*args, **kwargs):
     if VLLM_AVAILABLE:
         return base_fused_recurrent_gated_delta_rule(*args, **kwargs)
-    return flaggems_vllm.fused_recurrent_gated_delta_rule_fwd(*args, **kwargs)
+    return flaggems_vllm.ops_recurrent_gated_delta_rule_fwd(*args, **kwargs)
 
 
-@pytest.mark.skipif(flaggems_vllm.device != "cuda", reason="benchmark requires CUDA device")
+@pytest.mark.fused_recurrent_gated_delta_rule_fwd
 @pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize("qkv_contiguous", [False])
 def test_perf_fused_recurrent_gated_delta_rule(qkv_contiguous):
@@ -167,5 +167,5 @@ def test_perf_fused_recurrent_gated_delta_rule(qkv_contiguous):
         op_name="fused_recurrent_gated_delta_rule",
         torch_op=_torch_op_wrapper,
     )
-    bench.set_gems(flaggems_vllm.fused_recurrent_gated_delta_rule_fwd)
+    bench.set_gems(flaggems_vllm.ops_recurrent_gated_delta_rule_fwd)
     bench.run()

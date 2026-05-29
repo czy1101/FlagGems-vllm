@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.ops import weight_norm_interface, weight_norm_interface_backward
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 from flaggems_vllm.utils import triton_lang_extension as ext
@@ -192,9 +193,14 @@ class WeightNorm(torch.autograd.Function):
     def forward(ctx, v, g, dim=0):
         logger.debug("GEMS WEIGHT NORM")
         dim = dim % v.ndim
-        output, norm = weight_norm_except_dim(v, g, dim)
+        can_use_fused = dim == 0 or dim == v.ndim - 1
+        if can_use_fused:
+            output, norm = weight_norm_interface(v, g, dim)
+        else:
+            output, norm = weight_norm_except_dim(v, g, dim)
         ctx.save_for_backward(v, g, norm)
         ctx.dim = dim
+        ctx.can_use_fused = can_use_fused
         return output
 
     @staticmethod
@@ -202,7 +208,10 @@ class WeightNorm(torch.autograd.Function):
         logger.debug("GEMS WEIGHT NORM BACKWARD")
         v, g, norm = ctx.saved_tensors
         dim = ctx.dim
-        v_grad, g_grad = weight_norm_except_dim_backward(grad, v, g, norm, dim)
+        if ctx.can_use_fused:
+            v_grad, g_grad = weight_norm_interface_backward(grad, v, g, norm, dim)
+        else:
+            v_grad, g_grad = weight_norm_except_dim_backward(grad, v, g, norm, dim)
         return v_grad, g_grad, None
 
 

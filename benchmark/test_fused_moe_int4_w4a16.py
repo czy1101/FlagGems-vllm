@@ -135,7 +135,7 @@ def _vllm_fused_moe_int4_w4a16_wrapper(
     # Dequantize to bf16 and run standard bf16 path as baseline
     w1_deq = w1.to(hidden_states.dtype) * w1_scale.unsqueeze(-1).to(hidden_states.dtype)
     w2_deq = w2.to(hidden_states.dtype) * w2_scale.unsqueeze(-1).to(hidden_states.dtype)
-    return flaggems_vllm.fused_experts_impl(
+    return flaggems_vllm.ops_experts_impl(
         hidden_states.clone(),
         w1_deq,
         w2_deq,
@@ -148,7 +148,7 @@ def _gems_fused_moe_int4_w4a16_wrapper(
     hidden_states, w1, w2, topk_weights, topk_ids, w1_scale, w2_scale
 ):
     """Wrapper to call FlagGems fused_experts_impl with INT4 W4A16."""
-    return flaggems_vllm.fused_experts_impl(
+    return flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1,
         w2,

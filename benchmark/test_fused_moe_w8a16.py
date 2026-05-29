@@ -28,7 +28,7 @@ except ImportError:
 
 class FusedMoEMXQW8A16Benchmark(base.Benchmark):
     """
-    Benchmark for flaggems_vllm.fused_moe_mxq.fused_moe with W8A16 mixed precision.
+    Benchmark for flaggems_vllm.ops_moe_mxq.fused_moe with W8A16 mixed precision.
 
     Uses QuantMode.W8A16: INT8 weights, FP16 activations.
     Tests SwiGLU MoE: y = W2 @ (silu(W1 @ x) * (W3 @ x))
@@ -76,7 +76,7 @@ class FusedMoEMXQW8A16Benchmark(base.Benchmark):
         device = flaggems_vllm.device
         dtype = torch.bfloat16
 
-        from flaggems_vllm.fused_moe_mxq import QuantConfig, QuantMode, quantize_weights_moe
+        from flaggems_vllm.ops_moe_mxq import QuantConfig, QuantMode, quantize_weights_moe
 
         hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
 
@@ -198,9 +198,9 @@ def _baseline_w8a16_mxq_wrapper(
     num_experts,
     topk,
 ):
-    """FP16/BF16 reference: run flaggems_vllm.fused_experts_impl pure FP16 path."""
+    """FP16/BF16 reference: run flaggems_vllm.ops_experts_impl pure FP16 path."""
     del w1_q, w2_q, w3_q, w1_scale, w2_scale, w3_scale, num_experts, topk
-    return flaggems_vllm.fused_experts_impl(
+    return flaggems_vllm.ops_experts_impl(
         hidden_states.clone(),
         w1_fp16,
         w2_fp16,
@@ -255,9 +255,9 @@ def _gems_fused_moe_mxq_w8a16_wrapper(
     num_experts,
     topk,
 ):
-    """Test flaggems_vllm.fused_moe_mxq.fused_moe with W8A16."""
+    """Test flaggems_vllm.ops_moe_mxq.fused_moe with W8A16."""
     del w1_fp16, w2_fp16
-    from flaggems_vllm.fused_moe_mxq import QuantConfig, QuantMode, fused_moe
+    from flaggems_vllm.ops_moe_mxq import QuantConfig, QuantMode, fused_moe
 
     quant_config = QuantConfig(mode=QuantMode.W8A16, has_zero_point=False)
     return fused_moe(
@@ -286,7 +286,7 @@ def _gems_fused_moe_mxq_w8a16_wrapper(
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
 def test_fused_moe_w8a16_mxq():
     """
-    Benchmark flaggems_vllm.fused_moe_mxq.fused_moe with W8A16 mixed precision.
+    Benchmark flaggems_vllm.ops_moe_mxq.fused_moe with W8A16 mixed precision.
     """
     bench = FusedMoEMXQW8A16Benchmark(
         op_name="fused_moe_w8a16_mxq_gems_vs_bf16_deq",
@@ -302,7 +302,7 @@ def test_fused_moe_w8a16_mxq():
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
 def test_fused_moe_w8a16_mxq_gems_vs_vllm():
     """
-    Benchmark flaggems_vllm.fused_moe_mxq.fused_moe with W8A16 mixed precision.
+    Benchmark flaggems_vllm.ops_moe_mxq.fused_moe with W8A16 mixed precision.
     """
     bench = FusedMoEMXQW8A16Benchmark(
         op_name="fused_moe_w8a16_mxq_gems_vs_vllm",

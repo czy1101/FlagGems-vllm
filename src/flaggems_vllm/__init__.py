@@ -25,6 +25,13 @@ _FULL_CONFIG = tuple(
     if op_name in globals() and callable(globals()[op_name])
 )
 
+if "weight_norm_interface" in globals():
+    _FULL_CONFIG += (("_weight_norm_interface", weight_norm_interface),)
+if "weight_norm_interface_backward" in globals():
+    _FULL_CONFIG += (
+        ("_weight_norm_interface_backward", weight_norm_interface_backward),
+    )
+
 FULL_CONFIG_BY_FUNC: dict = {}
 for _item in _FULL_CONFIG:
     if not _item or len(_item) < 2:

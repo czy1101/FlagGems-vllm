@@ -674,6 +674,8 @@ def libtuner(
         str, Callable[[Any], Any], List[Union[str, Callable[[Any], Any]]]
     ] = "default",
     policy: Union[str, Type[LibTuner]] = "default",
+    flagtune_op_name=None,
+    flagtune_expand_op_name=None,
 ):
     """Decorator for triton library autotuner.
 

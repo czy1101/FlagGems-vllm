@@ -166,7 +166,7 @@ def _gems_fused_moe_fp8_blockwise_wrapper(
     hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
 ):
     """Wrapper to call FlagGems fused_experts_impl with block-wise FP8."""
-    return flaggems_vllm.fused_experts_impl(
+    return flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1,
         w2,

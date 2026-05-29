@@ -159,7 +159,7 @@ def test_fused_moe_vs_ref(config, dtype):
     topk_weights = topk_weights.to(dtype)
 
     # FlagGems result
-    result = flaggems_vllm.fused_experts_impl(
+    result = flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1,
         w2,
@@ -220,7 +220,7 @@ def test_fused_moe_vs_vllm(config, dtype):
     topk_weights = topk_weights.to(dtype)
 
     # FlagGems result
-    result = flaggems_vllm.fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids)
+    result = flaggems_vllm.ops_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids)
 
     # Reference result
     ref = vllm_fused_experts_impl(
@@ -306,7 +306,7 @@ def test_accuracy_fused_moe_fp8(config):
     topk_weights = topk_weights.to(dtype)
 
     # FlagGems FP8 result
-    result = flaggems_vllm.fused_experts_impl(
+    result = flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1_fp8,
         w2_fp8,
@@ -600,7 +600,7 @@ def test_fused_moe_fp8_blockwise(config, block_shape):
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_weights = topk_weights.to(dtype)
 
-    result = flaggems_vllm.fused_experts_impl(
+    result = flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1_fp8,
         w2_fp8,
@@ -676,7 +676,7 @@ def test_fused_moe_int8(config):
     topk_weights = topk_weights.to(dtype)
 
     # FlagGems INT8 result
-    result = flaggems_vllm.fused_experts_impl(
+    result = flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1_int8,
         w2_int8,
@@ -785,7 +785,7 @@ def test_fused_moe_int8_w8a16(config):
     topk_weights = topk_weights.to(dtype)
 
     # FlagGems INT8 W8A16 result
-    result = flaggems_vllm.fused_experts_impl(
+    result = flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1_int8,
         w2_int8,
@@ -862,7 +862,7 @@ def test_fused_moe_int4_w4a16(config):
     topk_weights = topk_weights.to(dtype)
 
     # FlagGems INT4 W4A16 result
-    result = flaggems_vllm.fused_experts_impl(
+    result = flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1_int4,
         w2_int4,
@@ -923,7 +923,7 @@ def test_fused_moe_inplace(config, dtype):
     topk_weights = topk_weights.to(dtype)
 
     # Non-inplace reference
-    ref = flaggems_vllm.fused_experts_impl(
+    ref = flaggems_vllm.ops_experts_impl(
         hidden_states.clone(),
         w1,
         w2,
@@ -934,7 +934,7 @@ def test_fused_moe_inplace(config, dtype):
 
     # Inplace result
     hidden_copy = hidden_states.clone()
-    result = flaggems_vllm.fused_experts_impl(
+    result = flaggems_vllm.ops_experts_impl(
         hidden_copy,
         w1,
         w2,
@@ -980,7 +980,7 @@ def test_fused_moe_apply_router_weight_on_input(config, dtype):
     topk_weights = topk_weights.to(dtype)
 
     # Default (weight on GEMM2 output)
-    result_default = flaggems_vllm.fused_experts_impl(
+    result_default = flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1,
         w2,
@@ -990,7 +990,7 @@ def test_fused_moe_apply_router_weight_on_input(config, dtype):
     )
 
     # Weight on GEMM1 input
-    result_on_input = flaggems_vllm.fused_experts_impl(
+    result_on_input = flaggems_vllm.ops_experts_impl(
         hidden_states,
         w1,
         w2,

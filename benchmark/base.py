@@ -142,7 +142,7 @@ class Benchmark:
 
         try:
             with open(shape_file_path, "r") as file:
-                yaml_config = yaml.safe_load(file) or {}
+                yaml_config = yaml.safe_load(file)
                 if self.op_name in yaml_config:
                     self.shapes = yaml_config[self.op_name].get(
                         "shapes", self.DEFAULT_SHAPES
@@ -267,11 +267,7 @@ class Benchmark:
             end = time.time()
             latency = (end - start) / Config.repetition * 1000
         elif Config.mode == consts.BenchMode.KERNEL:
-            do_bench = (
-                triton.musa_testing.do_bench
-                if device == "musa"
-                else triton.testing.do_bench
-            )
+            do_bench = triton.testing.do_bench
             latency = do_bench(
                 fn,
                 warmup=Config.warm_up,

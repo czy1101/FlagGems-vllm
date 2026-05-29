@@ -55,6 +55,8 @@ from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size_triton,
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
+from flaggems_vllm.ops.mul import mul, mul_
+from flaggems_vllm.ops.mv import mv
 from flaggems_vllm.ops.outer import outer
 from flaggems_vllm.ops.pack_seq import pack_seq_triton
 from flaggems_vllm.ops.per_token_group_quant_fp8 import (
@@ -80,6 +82,10 @@ from flaggems_vllm.ops.top_k_per_row_prefill import top_k_per_row_prefill
 from flaggems_vllm.ops.topk_softmax import topk_softmax
 from flaggems_vllm.ops.topk_softplus_sqrt import topk_softplus_sqrt
 from flaggems_vllm.ops.unpack_seq import unpack_seq_triton
+from flaggems_vllm.ops.weightnorm import (
+    weight_norm_interface,
+    weight_norm_interface_backward,
+)
 from flaggems_vllm.ops.weight_norm import weight_norm
 
 __all__ = [
@@ -124,6 +130,9 @@ __all__ = [
     "moe_align_block_size",
     "moe_align_block_size_triton",
     "moe_sum",
+    "mul",
+    "mul_",
+    "mv",
     "outer",
     "outplace_fused_experts",
     "pack_seq_triton",
@@ -148,4 +157,6 @@ __all__ = [
     "topk_softplus_sqrt",
     "unpack_seq_triton",
     "weight_norm",
+    "weight_norm_interface",
+    "weight_norm_interface_backward",
 ]

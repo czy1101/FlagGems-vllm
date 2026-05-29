@@ -2,6 +2,8 @@ import logging
 
 import torch
 
+from flaggems_vllm.ops import mul, mv
+
 logger = logging.getLogger(__name__)
 
 
@@ -14,7 +16,7 @@ class Outer(torch.autograd.Function):
         weight1 = weight[None, :]
         inp1 = inp1.contiguous()
         weight1 = weight1.contiguous()
-        out = torch.mul(inp1, weight1)
+        out = mul(inp1, weight1)
         ctx.save_for_backward(inp, weight)
         return out
 
@@ -25,8 +27,8 @@ class Outer(torch.autograd.Function):
 
         inp, weight = ctx.saved_tensors
 
-        inp_grad = torch.mv(out_grad, weight)
-        weight_grad = torch.mv(out_grad.t(), inp)
+        inp_grad = mv(out_grad, weight)
+        weight_grad = mv(out_grad.t(), inp)
 
         return inp_grad, weight_grad
 
