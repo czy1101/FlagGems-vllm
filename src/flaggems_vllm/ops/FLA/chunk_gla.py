@@ -117,11 +117,7 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra(
     if i_t * BT + i_i * BC >= T:
         return
 
-    o_i = tl.arange(0, BC)
-    o_k = tl.arange(0, BK)
-    o_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) * H*BT + i_j * BC
-    m_k = o_k < K
-    m_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) < T
+    m_s = tl.arange(0, BC)[:, None] >= tl.arange(0, BC)[None, :]
 
     q += (bos * H + i_h) * K
     k += (bos * H + i_h) * K
@@ -130,23 +126,24 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra(
 
     p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
     p_g = tl.make_block_ptr(g, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_g = tl.load(p_g, boundary_check=(0, 1))
+    p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT + i_j * BC, 0), (BC, BK), (1, 0))
+    p_gk = tl.make_block_ptr(g, (T, K), (H*K, 1), (i_t * BT + i_j * BC, 0), (BC, BK), (1, 0))
+    p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
 
-    p_k = k + (i_t * BT + i_j * BC) * H*K + o_k
-    p_gk = g + (i_t * BT + i_j * BC) * H*K + o_k
+    b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
+    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+    b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
+    b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
 
-    for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
-        b_k = tl.load(p_k, mask=m_k, other=0).to(tl.float32)
-        b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
-        b_A = tl.sum(b_q * b_k[None, :] * exp(b_g - b_gk[None, :]), 1) * scale
-        tl.store(A + o_A + j, b_A, mask=m_A)
-        p_k += H*K
-        p_gk += H*K
-
-    tl.debug_barrier()
-    b_A = tl.zeros([BC, BC], dtype=tl.float32)
-    tl.store(A + o_A[:, None] + o_i, b_A, mask=m_A[:, None] & (o_i[:, None] < o_i))
+    g_max = tl.max(b_g, axis=0)
+    g_min = tl.min(b_g, axis=0)
+    g_mid = 0.5 * (g_max + g_min)
+    b_qg = b_q * exp(b_g - g_mid[None, :])
+    b_kg = b_k * exp(-(b_gk - g_mid[None, :]))
+   
+    b_A = tl.dot(b_qg, tl.trans(b_kg)) * scale
+    b_A = tl.where(m_s, b_A, 0.)
+    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.heuristics({
@@ -187,11 +184,9 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split(
     if i_t * BT + i_i * BC >= T:
         return
 
-    o_i = tl.arange(0, BC)
+    m_s = tl.arange(0, BC)[:, None] >= tl.arange(0, BC)[None, :]
     o_k = i_k * BK + tl.arange(0, BK)
-    o_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) * H*BC
     m_k = o_k < K
-    m_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) < T
 
     q += (bos * H + i_h) * K
     k += (bos * H + i_h) * K
@@ -200,22 +195,23 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split(
 
     p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
     p_g = tl.make_block_ptr(g, (T, K), (H*K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
+    p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
+    p_gk = tl.make_block_ptr(g, (T, K), (H*K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
+    p_A = tl.make_block_ptr(A, (T, BC), (H*BC, 1), (i_t * BT + i_i * BC, 0), (BC, BC), (1, 0))
+
+    p_gn = g + (i_t * BT + i_i * BC) * H*K + o_k
+    b_gn = tl.load(p_gn, mask=m_k, other=0)
+
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_g = tl.load(p_g, boundary_check=(0, 1))
+    b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
+    b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
 
-    p_k = k + (i_t * BT + i_j * BC) * H*K + o_k
-    p_gk = g + (i_t * BT + i_j * BC) * H*K + o_k
-    for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
-        b_k = tl.load(p_k, mask=m_k, other=0).to(tl.float32)
-        b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
-        b_A = tl.sum(b_q * b_k[None, :] * exp(b_g - b_gk[None, :]), 1) * scale
-        tl.store(A + o_A + j, b_A, mask=m_A)
-        p_k += H*K
-        p_gk += H*K
-
-    tl.debug_barrier()
-    b_A = tl.zeros([BC, BC], dtype=tl.float32)
-    tl.store(A + o_A[:, None] + o_i, b_A, mask=m_A[:, None] & (o_i[:, None] < o_i))
+    b_qg = b_q * exp(b_g - b_gn[None, :])
+    b_kg = b_k * exp(b_gn[None, :] - b_gk)
+    b_A = tl.dot(b_qg, tl.trans(b_kg)) * scale
+    b_A = tl.where(m_s, b_A, 0.)
+    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.heuristics({
