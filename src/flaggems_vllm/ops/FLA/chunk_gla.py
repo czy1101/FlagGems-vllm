@@ -26,6 +26,19 @@ BV_LIST = [64, 128] if check_shared_mem("ampere") else [16, 32]
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BK': BK},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for BK in [32, 64]
+        for num_warps in [1, 2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['BC'],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_A_kernel_intra_sub_inter(
     q,
@@ -131,6 +144,18 @@ def chunk_gla_fwd_A_kernel_intra_sub_inter(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for num_warps in [1, 2, 4, 8]
+        for num_stages in [2, 3]
+    ],
+    key=['BK', 'BT'],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_A_kernel_intra_sub_intra(
     q,
@@ -208,6 +233,13 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
+)
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4, 8]
+    ],
+    key=['BC', 'BK'],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_A_kernel_intra_sub_intra_split(
@@ -293,6 +325,15 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
+    key=['BC'],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
     A,
@@ -351,6 +392,20 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
+)
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BK': BK, 'BV': BV},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for BK in [32, 64]
+        for BV in [64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['BT', 'HV', 'STATE_V_FIRST'],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -451,6 +506,18 @@ def chunk_gla_fwd_kernel_o(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
+)
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for num_warps in [1, 2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['BK', 'NC', 'BT'],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_bwd_kernel_intra(
@@ -662,6 +729,18 @@ def chunk_gla_bwd_kernel_intra(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for num_warps in [1, 2, 4]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['BV', 'BT'],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_bwd_kernel_dA(
     v,
@@ -725,6 +804,20 @@ def chunk_gla_bwd_kernel_dA(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
+)
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BK': BK, 'BV': BV},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for BK in BK_LIST
+        for BV in BV_LIST
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['BT', 'STATE_V_FIRST'],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_bwd_kernel_dv(
@@ -847,6 +940,20 @@ def chunk_gla_bwd_kernel_dv(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
+)
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BK': BK, 'BV': BV},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for BK in BK_LIST
+        for BV in BV_LIST
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['BT', 'STATE_V_FIRST'],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_bwd_kernel_inter(
