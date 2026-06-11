@@ -10,10 +10,14 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_offsets
-from flaggems_vllm.ops.FLA.triton_ops_helper import exp
 from flaggems_vllm.ops.FLA.utils import check_shared_mem
 
 BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+
+@triton.jit
+def exp2(x):
+    return tl.math.exp2(x.to(tl.float32))
 
 
 @triton.heuristics(
@@ -83,7 +87,8 @@ def chunk_fwd_kernel_h(
         b_gamma = tl.load(g_gamma + i_h)
         b_g = b_gamma * (tl.arange(0, BT) + 1)
 
-    # [BK, BV] accumulator; STATE_V_FIRST only flips the stored state's HBM layout to [V, K], applied at the load/store below.
+    # [BK, BV] accumulator; STATE_V_FIRST only flips the stored state's HBM layout to [V, K]
+    # applied at the load/store below.
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
         if STATE_V_FIRST:
@@ -153,13 +158,13 @@ def chunk_fwd_kernel_h(
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
             p_g = g + bos * H + (i_t * BT + tl.arange(0, BT)) * H + i_h
             b_g = tl.load(p_g, mask=(i_t * BT + tl.arange(0, BT) < T), other=0.0)
-            b_h *= exp(b_g_last)
-            b_v = (b_v * exp(b_g_last - b_g)[:, None]).to(b_v.dtype)
+            b_h *= exp2(b_g_last)
+            b_v = (b_v * exp2(b_g_last - b_g)[:, None]).to(b_v.dtype)
 
         if USE_G_GAMMA:
             b_g_last = b_gamma * min(BT, T - i_t * BT)
-            b_h *= exp(b_g_last)
-            b_v = (b_v * exp(b_g_last - b_g)[:, None]).to(b_v.dtype)
+            b_h *= exp2(b_g_last)
+            b_v = (b_v * exp2(b_g_last - b_g)[:, None]).to(b_v.dtype)
 
         # vector decay, h = Diag(gk) @ h
         if USE_GK:
@@ -179,8 +184,8 @@ def chunk_fwd_kernel_h(
                 p_gk_last, mask=(i_k * BK + tl.arange(0, BK) < K), other=0.0
             )
             b_gk = tl.load(p_gk, boundary_check=(0, 1))
-            b_h *= exp(b_gk_last)[:, None]
-            b_k = (b_k * exp(b_gk_last[:, None] - b_gk)).to(b_k.dtype)
+            b_h *= exp2(b_gk_last)[:, None]
+            b_k = (b_k * exp2(b_gk_last[:, None] - b_gk)).to(b_k.dtype)
 
         # vector decay, h = h @ Diag(gv)
         if USE_GV:
@@ -200,8 +205,8 @@ def chunk_fwd_kernel_h(
                 p_gv_last, mask=(i_v * BV + tl.arange(0, BV) < V), other=0.0
             )
             b_gv = tl.load(p_gv, boundary_check=(0, 1))
-            b_h *= exp(b_gv_last)[None, :]
-            b_v = (b_v * exp(b_gv_last[None, :] - b_gv)).to(b_v.dtype)
+            b_h *= exp2(b_gv_last)[None, :]
+            b_v = (b_v * exp2(b_gv_last[None, :] - b_gv)).to(b_v.dtype)
 
         b_h += tl.dot(b_k, b_v)
 
@@ -301,7 +306,8 @@ def chunk_bwd_kernel_dh(
         b_gamma = tl.load(g_gamma + i_h)
         b_g = b_gamma * (tl.arange(0, BT) + 1)
 
-    # [BK, BV] accumulator; STATE_V_FIRST only flips the stored state's HBM layout to [V, K], applied at the load/store below.
+    # [BK, BV] accumulator; STATE_V_FIRST only flips the stored state's HBM layout to [V, K]
+    # applied at the load/store below.
     b_dh = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_FINAL_STATE_GRADIENT:
         if STATE_V_FIRST:
@@ -370,13 +376,13 @@ def chunk_bwd_kernel_dh(
             p_g = g + (bos + i_t * BT + tl.arange(0, BT)) * H + i_h
             b_g_last = tl.load(g + (bos + last_idx) * H + i_h)
             b_g = tl.load(p_g, mask=(i_t * BT + tl.arange(0, BT) < T), other=0.0)
-            b_q = (b_q * exp(b_g)[None, :]).to(b_q.dtype)
-            b_dh *= exp(b_g_last)
+            b_q = (b_q * exp2(b_g)[None, :]).to(b_q.dtype)
+            b_dh *= exp2(b_g_last)
 
         if USE_G_GAMMA:
             b_g_last = b_gamma * min(BT, T - i_t * BT)
-            b_q = (b_q * exp(b_g)[None, :]).to(b_q.dtype)
-            b_dh *= exp(b_g_last)
+            b_q = (b_q * exp2(b_g)[None, :]).to(b_q.dtype)
+            b_dh *= exp2(b_g_last)
 
         if USE_GK:
             p_gk = tl.make_block_ptr(
@@ -395,8 +401,8 @@ def chunk_bwd_kernel_dh(
             b_gk_last = tl.load(
                 p_gk_last, mask=(i_k * BK + tl.arange(0, BK) < K), other=0.0
             )
-            b_q = (b_q * exp(b_gk)).to(b_q.dtype)
-            b_dh *= exp(b_gk_last)[:, None]
+            b_q = (b_q * exp2(b_gk)).to(b_q.dtype)
+            b_dh *= exp2(b_gk_last)[:, None]
 
         if USE_GV:
             p_gv = tl.make_block_ptr(
@@ -415,8 +421,8 @@ def chunk_bwd_kernel_dh(
             b_gv_last = tl.load(
                 p_gv_last, mask=(i_v * BV + tl.arange(0, BV) < V), other=0.0
             )
-            b_do = b_do * exp(b_gv)
-            b_dh *= exp(b_gv_last)[None, :]
+            b_do = b_do * exp2(b_gv)
+            b_dh *= exp2(b_gv_last)[None, :]
 
         b_dh += tl.dot(b_q, b_do.to(b_q.dtype))
 
