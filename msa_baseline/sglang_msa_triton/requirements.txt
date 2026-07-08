@@ -1,0 +1,7 @@
+# sglang msa triton — standalone MiniMax sparse attention operators
+#
+# Core dependencies:
+torch
+triton
+# Optional (for JIT top-k select & dense main-attn page-table paths):
+# sglang

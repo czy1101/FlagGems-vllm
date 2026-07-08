@@ -1,0 +1,6 @@
+# Minimum recommended versions for the MSA vLLM Triton Benchmark project.
+# DO NOT pip install with this file -- the project uses a pre-configured conda env.
+
+torch>=2.3.0
+triton>=3.0.0
+# numpy (implicit, comes with torch)
