@@ -139,9 +139,9 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
         return False
 
     # property names differ across torch versions/drivers; try common ones
-    max_shared = getattr(props, "max_shared_memory_per_multiprocessor", None)
+    max_shared = getattr(props, "shared_memory_per_multiprocessor", None)
     if max_shared is None:
-        max_shared = getattr(props, "max_shared_memory", None)
+        max_shared = getattr(props, "max_shared_mem", None)
     if max_shared is None:
         # fallback conservative default
         return False
