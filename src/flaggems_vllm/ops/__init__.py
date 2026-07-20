@@ -24,6 +24,14 @@ from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
+from flaggems_vllm.ops.MSA import (
+    SPARSE_BLOCK_SIZE,
+    minimax_m3_index_decode,
+    minimax_m3_index_score,
+    minimax_m3_index_topk,
+    minimax_m3_sparse_attn,
+    minimax_m3_sparse_attn_decode,
+)
 from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_fwd,
@@ -189,7 +197,13 @@ __all__ = [
     "silu_and_mul_with_clamp_out",
     "sinkhorn_forward",
     "skip_layer_norm",
+    "SPARSE_BLOCK_SIZE",
     "sparse_attn_triton",
+    "minimax_m3_index_decode",
+    "minimax_m3_index_score",
+    "minimax_m3_index_topk",
+    "minimax_m3_sparse_attn",
+    "minimax_m3_sparse_attn_decode",
     "stage_deepseek_v4_mega_moe_inputs",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
