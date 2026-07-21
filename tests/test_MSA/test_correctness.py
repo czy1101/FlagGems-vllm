@@ -164,15 +164,15 @@ test_decode.__test__ = False
 
 def test_msa_correctness():
     results = [
-        test_prefill(batch=2, seq_len=512, num_kv_heads=4, topk=16),
-        test_prefill(batch=2, seq_len=1024, num_kv_heads=4, topk=16),
-        test_prefill(batch=1, seq_len=4096, num_kv_heads=4, topk=32),
-        test_prefill(batch=4, seq_len=512, num_kv_heads=8, topk=16),
-        test_prefill(batch=2, seq_len=2048, num_kv_heads=4, topk=48),
-        test_decode(batch=1, seq_len=512, num_kv_heads=4, topk=16),
-        test_decode(batch=4, seq_len=2048, num_kv_heads=4, topk=32),
-        test_decode(batch=1, seq_len=8192, num_kv_heads=4, topk=48),
-        test_decode(batch=8, seq_len=1024, num_kv_heads=8, topk=32),
+        test_prefill(batch=2, seq_len=2048, num_kv_heads=4, topk=3),
+        test_prefill(batch=2, seq_len=1024, num_kv_heads=4, topk=4),
+        test_prefill(batch=1, seq_len=4096, num_kv_heads=4, topk=5),
+        test_prefill(batch=4, seq_len=4096, num_kv_heads=8, topk=8),
+        test_prefill(batch=2, seq_len=2048, num_kv_heads=4, topk=6),
+        test_decode(batch=1, seq_len=512, num_kv_heads=4, topk=3),
+        test_decode(batch=4, seq_len=2048, num_kv_heads=4, topk=4),
+        test_decode(batch=1, seq_len=8192, num_kv_heads=4, topk=8),
+        test_decode(batch=8, seq_len=2048, num_kv_heads=8, topk=5),
         test_decode(
             batch=4,
             seq_len=2048,
@@ -193,19 +193,19 @@ def main():
     print("=" * 70)
     print("  Prefill Correctness Tests")
     print("=" * 70)
-    results.append(("prefill_small", test_prefill(batch=2, seq_len=512, num_kv_heads=4, topk=16)))
-    results.append(("prefill_med",   test_prefill(batch=2, seq_len=1024, num_kv_heads=4, topk=16)))
-    results.append(("prefill_long",  test_prefill(batch=1, seq_len=4096, num_kv_heads=4, topk=32)))
-    results.append(("prefill_batch", test_prefill(batch=4, seq_len=512, num_kv_heads=8, topk=16)))
-    results.append(("prefill_big",   test_prefill(batch=2, seq_len=2048, num_kv_heads=4, topk=48)))
+    results.append(("prefill_small", test_prefill(batch=2, seq_len=2048, num_kv_heads=4, topk=3)))
+    results.append(("prefill_med",   test_prefill(batch=2, seq_len=1024, num_kv_heads=4, topk=4)))
+    results.append(("prefill_long",  test_prefill(batch=1, seq_len=4096, num_kv_heads=4, topk=5)))
+    results.append(("prefill_batch", test_prefill(batch=4, seq_len=4096, num_kv_heads=8, topk=8)))
+    results.append(("prefill_big",   test_prefill(batch=2, seq_len=2048, num_kv_heads=4, topk=6)))
 
     print("\n" + "=" * 70)
     print("  Decode Correctness Tests")
     print("=" * 70)
-    results.append(("decode_small", test_decode(batch=1, seq_len=512, num_kv_heads=4, topk=16)))
-    results.append(("decode_med",   test_decode(batch=4, seq_len=2048, num_kv_heads=4, topk=32)))
-    results.append(("decode_long",  test_decode(batch=1, seq_len=8192, num_kv_heads=4, topk=48)))
-    results.append(("decode_batch", test_decode(batch=8, seq_len=1024, num_kv_heads=8, topk=32)))
+    results.append(("decode_small", test_decode(batch=1, seq_len=512, num_kv_heads=4, topk=3)))
+    results.append(("decode_med",   test_decode(batch=4, seq_len=2048, num_kv_heads=4, topk=4)))
+    results.append(("decode_long",  test_decode(batch=1, seq_len=8192, num_kv_heads=4, topk=8)))
+    results.append(("decode_batch", test_decode(batch=8, seq_len=2048, num_kv_heads=8, topk=5)))
     results.append(("decode_spec",  test_decode(batch=4, seq_len=2048, num_kv_heads=4, topk=32, decode_qlen=1)))
 
     print("\n" + "=" * 70)
