@@ -1,6 +1,6 @@
 """Adapter: call vLLM's MSA Triton kernels using paged KV cache.
 
-Our paged:  kv_cache [num_blocks, 2, 128, H, D], index_kv_cache [num_blocks, 128, D]
+Shared paged: kv_cache [num_blocks, H, 128, 2*D], index_kv_cache [num_blocks, 128, D]
 vLLM paged: kv_cache [num_blocks, H, 128, 2*D], index_kv_cache [num_blocks, 128, D]
 
 Uses importlib + stubs to bypass vLLM framework (no vllm._C needed).
@@ -81,24 +81,16 @@ def _ensure_vllm_imported():
 
 
 def _convert_kv_cache(kv_cache):
-    """Our [num_blocks, 2, 128, H, D] → vLLM [num_blocks, H, 128, 2*D]."""
-    num_blocks, _, _, num_kv_heads, head_dim = kv_cache.shape
-    k = kv_cache[:, 0]  # [num_blocks, 128, H, D]
-    v = kv_cache[:, 1]  # [num_blocks, 128, H, D]
-    # Permute to [num_blocks, H, 128, D] then cat along last dim
-    k_p = k.permute(0, 2, 1, 3).contiguous()  # [num_blocks, H, 128, D]
-    v_p = v.permute(0, 2, 1, 3).contiguous()
-    return torch.cat([k_p, v_p], dim=-1)  # [num_blocks, H, 128, 2*D]
+    # The input already uses the vLLM paged KV layout.
+    return kv_cache
 
 
 def _get_vllm_kv_cache(kv_cache):
-    """Convert once per benchmark input; layout preparation is not a kernel."""
     global _cached_kv_source, _cached_vllm_kv
     if _cached_kv_source is not kv_cache:
         _cached_kv_source = kv_cache
         _cached_vllm_kv = _convert_kv_cache(kv_cache)
     return _cached_vllm_kv
-
 
 def clear_vllm_cache():
     """Release the one-entry conversion cache between benchmark shapes."""
@@ -108,24 +100,27 @@ def clear_vllm_cache():
 
 
 def vllm_prefill(q, idx_q, kv_cache, index_kv_cache, block_table, cu_q, sl, pl,
-                 seq_len, n_kv_h, topk, init_blocks, local_blocks, sm_scale):
+                 seq_len, n_kv_h, topk, init_blocks, local_blocks, sm_scale,
+                 output: torch.Tensor | None = None):
     _ensure_vllm_imported()
     ops = _vllm_ops
     vllm_kv = _get_vllm_kv_cache(kv_cache)
     scores = ops["index_score"](idx_q, index_kv_cache, block_table, cu_q, sl, pl, seq_len, seq_len, n_kv_h)
     topk_idx = ops["index_topk"](scores, cu_q, pl, seq_len, topk, init_blocks, local_blocks)
-    output = torch.empty_like(q)
+    if output is None:
+        output = torch.empty_like(q)
     ops["sparse_attn"](q, vllm_kv, topk_idx, block_table, cu_q, sl, pl, seq_len, n_kv_h, sm_scale, output)
     return output
 
-
 def vllm_decode(q, idx_q, kv_cache, index_kv_cache, block_table, cu_q, sl,
-               seq_len, n_kv_h, topk, init_blocks, local_blocks, sm_scale, decode_qlen=1):
+               seq_len, n_kv_h, topk, init_blocks, local_blocks, sm_scale,
+               decode_qlen=1, output: torch.Tensor | None = None):
     _ensure_vllm_imported()
     ops = _vllm_ops
     vllm_kv = _get_vllm_kv_cache(kv_cache)
     topk_idx = ops["index_decode"](idx_q, index_kv_cache, block_table, sl, seq_len, topk,
                                    init_blocks, local_blocks, n_kv_h, decode_qlen, decode_qlen)
-    output = torch.empty_like(q)
+    if output is None:
+        output = torch.empty_like(q)
     ops["sparse_attn_decode"](q, vllm_kv, topk_idx, block_table, sl, n_kv_h, sm_scale, output, decode_qlen)
     return output

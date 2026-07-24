@@ -15,13 +15,11 @@ feed the block-sparse attention kernels in ``sparse_attn``.
 """
 
 import torch
+
+from .utils import current_platform
 import triton
 import triton.language as tl
-
-try:
-    from .utils import current_platform, round_up
-except ImportError:  # Direct execution from the MSA operator directory.
-    from utils import current_platform, round_up
+from .utils import round_up
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -318,19 +316,16 @@ def _decode_index_score_kernel(
     stride_bt_b,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_Q: tl.constexpr,
-    BLOCK_SIZE_HQ: tl.constexpr,
     num_kv_chunks,
     USE_PDL: tl.constexpr,
 ):
+    BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
     hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
     h_offsets = hq_offsets // BLOCK_SIZE_Q
     q_offsets = hq_offsets % BLOCK_SIZE_Q
-    # tl.arange requires a power-of-two extent. BLOCK_SIZE_HQ is padded by
-    # the host; mask heads in the padding (e.g. 6 index heads -> tile of 8).
-    h_mask = h_offsets < num_idx_heads
-    q_mask = (q_offsets < decode_query_len) & h_mask
+    q_mask = q_offsets < decode_query_len
     q_ids = pid_r * decode_query_len + q_offsets
 
     if USE_PDL:
@@ -763,25 +758,26 @@ def minimax_m3_index_topk(
 
 
 @torch.no_grad()
-def minimax_m3_index_decode(
+def minimax_m3_index_decode_score(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
     block_table: torch.Tensor,  # [num_reqs, max_blocks]
     seq_lens: torch.Tensor,  # [num_reqs] int32
     max_seq_len: int,
-    topk: int,
     init_blocks: int,
     local_blocks: int,
     num_kv_heads: int,
     decode_query_len: int,
     max_decode_query_len: int,
-    out: torch.Tensor | None = None,
+    score_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Decode index block-score + top-k, both split-K (cudagraph-safe).
+    """Decode index block-score (split-K, cudagraph-safe); no top-k.
 
-    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
-    When ``out`` ([num_kv_heads, >=total_q, topk]) is given, writes into
-    ``out[:, :total_q, :]`` (stable address for cudagraph) instead of allocating.
+    Returns score [num_kv_heads, total_q, >=max_block] (fp32; init/local blocks
+    forced to 1e30/1e29). When ``score_out`` is given the scores are written into
+    it (read/written by strides, so a transposed view of a unified buffer is
+    accepted) instead of a fresh tensor -- used to share a unified score buffer
+    with the prefill side and run a single top-k over both.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert num_idx_heads == num_kv_heads, (
@@ -789,7 +785,6 @@ def minimax_m3_index_decode(
     )
     assert decode_query_len <= max_decode_query_len
     assert total_q == seq_lens.shape[0] * decode_query_len
-    batch = total_q
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     use_pdl = current_platform.is_arch_support_pdl()
     # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
@@ -806,13 +801,16 @@ def minimax_m3_index_decode(
     if num_idx_heads > 1 and max_decode_query_len > 1:
         score_kwargs.update({"num_warps": 4, "num_stages": 2})
 
-    # Keep score strides 16-divisible to avoid Triton recompiles.
-    score_block_stride = round_up(max_block, 16)
-    score = torch.empty(
-        (num_idx_heads, total_q, score_block_stride),
-        dtype=torch.float32,
-        device=idx_q.device,
-    )
+    if score_out is not None:
+        score = score_out
+    else:
+        # Keep score strides 16-divisible to avoid Triton recompiles.
+        score_block_stride = round_up(max_block, 16)
+        score = torch.empty(
+            (num_idx_heads, total_q, score_block_stride),
+            dtype=torch.float32,
+            device=idx_q.device,
+        )
     # split-K over seq blocks; chunk count depends only on shape constants so
     # the grid is fixed within a cuda graph.
     TARGET_GRID = 512
@@ -820,7 +818,6 @@ def minimax_m3_index_decode(
     # Use the configured max decode length to avoid Triton recompiles when
     # switching between qlen=1 and spec-decode verification batches.
     BLOCK_SIZE_Q = triton.next_power_of_2(max_decode_query_len)
-    BLOCK_SIZE_HQ = triton.next_power_of_2(num_idx_heads * BLOCK_SIZE_Q)
     score_ctas_per_chunk = seq_lens.shape[0]
     target = max(
         1,
@@ -851,10 +848,58 @@ def minimax_m3_index_decode(
         block_table.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
-        BLOCK_SIZE_HQ=BLOCK_SIZE_HQ,
         num_kv_chunks=num_kv_chunks,
         USE_PDL=use_pdl,
         **score_kwargs,
+    )
+    return score
+
+
+@torch.no_grad()
+def minimax_m3_index_decode(
+    idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
+    index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
+    block_table: torch.Tensor,  # [num_reqs, max_blocks]
+    seq_lens: torch.Tensor,  # [num_reqs] int32
+    max_seq_len: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    num_kv_heads: int,
+    decode_query_len: int,
+    max_decode_query_len: int,
+    out: torch.Tensor | None = None,
+    score_out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode index block-score + top-k, both split-K (cudagraph-safe).
+
+    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
+    When ``out`` ([num_kv_heads, >=total_q, topk]) is given, writes into
+    ``out[:, :total_q, :]`` (stable address for cudagraph) instead of allocating.
+    When ``score_out`` ([num_kv_heads, total_q, >=max_block]) is given, the block
+    scores are written into it (read back by the top-k) instead of a fresh
+    tensor -- used to share a unified score buffer with the prefill side. Reads
+    via strides, so a transposed view of a block-major buffer is accepted.
+    """
+    total_q, num_idx_heads, _ = idx_q.shape
+    batch = total_q
+    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    use_pdl = current_platform.is_arch_support_pdl()
+    pdl_kwargs: dict[str, bool | int] = {}
+    if use_pdl:
+        pdl_kwargs.update({"launch_pdl": True})
+    score = minimax_m3_index_decode_score(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        seq_lens,
+        max_seq_len,
+        init_blocks,
+        local_blocks,
+        num_kv_heads,
+        decode_query_len,
+        max_decode_query_len,
+        score_out=score_out,
     )
 
     if out is not None:

@@ -75,7 +75,7 @@ def main():
                     vllm_decode(
                         q, idx_q, kv, idx_kv, block_table, cu_q, sl, seq_len,
                         num_kv_heads, args.topk, args.init_blocks,
-                        args.local_blocks, scale, args.decode_qlen,
+                        args.local_blocks, scale, args.decode_qlen, output=output,
                     )
             if not args.no_sglang:
                 def baseline_sglang():
@@ -97,7 +97,7 @@ def main():
                     vllm_prefill(
                         q, idx_q, kv, idx_kv, block_table, cu_q, sl, pl,
                         seq_len, num_kv_heads, args.topk, args.init_blocks,
-                        args.local_blocks, scale,
+                        args.local_blocks, scale, output=output,
                     )
             if not args.no_sglang:
                 def baseline_sglang():

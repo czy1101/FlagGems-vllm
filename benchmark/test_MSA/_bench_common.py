@@ -1,7 +1,7 @@
 """Shared benchmark logic for paged KV cache format.
 
 Data format (same as vLLM):
-  kv_cache: [num_blocks, 2, 128, num_kv_heads, head_dim]  K=[:,0] V=[:,1]
+  kv_cache: [num_blocks, num_kv_heads, 128, 2*head_dim]  K=[..., :head_dim] V=[..., head_dim:]
   index_kv_cache: [num_blocks, 128, head_dim]
   block_table: [batch, max_blocks]  (identity mapping)
 """
@@ -33,7 +33,7 @@ from flaggems_vllm.ops.MSA import (
 
 BLOCK = SPARSE_BLOCK_SIZE
 HEAD_DIM = 128
-DEFAULT_WARMUP, DEFAULT_REP = 5, 30
+DEFAULT_WARMUP, DEFAULT_REP = 200, 300
 
 ALL_SHAPES = [
     (1, 8192, 16, 96),
@@ -87,15 +87,15 @@ def make_data(batch, seq_len, num_kv_heads, num_heads, device, dtype,
     index_k_cont = torch.randn(total_blocks * BLOCK, head_dim,
                                device=device, dtype=dtype)
 
-    # Paged KV cache: [num_blocks, 2, 128, num_kv_heads, head_dim]
+    # vLLM paged KV cache: [num_blocks, num_kv_heads, 128, 2*head_dim]
     kv_cache = torch.empty(
-        total_blocks, 2, BLOCK, num_kv_heads, head_dim,
+        total_blocks, num_kv_heads, BLOCK, 2 * head_dim,
         device=device, dtype=dtype,
     )
-    k_paged = k_cont.reshape(total_blocks, BLOCK, num_kv_heads, head_dim)
-    kv_cache[:, 0] = k_paged
-    v_paged = v_cont.reshape(total_blocks, BLOCK, num_kv_heads, head_dim)
-    kv_cache[:, 1] = v_paged
+    k_paged = k_cont.reshape(total_blocks, BLOCK, num_kv_heads, head_dim).permute(0, 2, 1, 3)
+    kv_cache[..., :head_dim] = k_paged
+    v_paged = v_cont.reshape(total_blocks, BLOCK, num_kv_heads, head_dim).permute(0, 2, 1, 3)
+    kv_cache[..., head_dim:] = v_paged
 
     # Index KV cache: [num_blocks, 128, head_dim]
     index_kv_cache = index_k_cont.reshape(total_blocks, BLOCK, head_dim)

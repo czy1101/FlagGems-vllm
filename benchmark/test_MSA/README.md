@@ -13,13 +13,13 @@ vLLM 和 sglang baseline 都是可选的：如果同级仓库或指定路径不�
 旧目录使用 continuous K/V；本目录使用分页缓存：
 
 ```text
-kv_cache:       [num_blocks, 2, 128, num_kv_heads, head_dim]
+kv_cache:       [num_blocks, num_kv_heads, 128, 2*head_dim]
 index_kv_cache: [num_blocks, 128, head_dim]
 block_table:    [batch, max_blocks]
 ```
 
 逻辑块 `block` 通过 `page = block_table[request, block]` 找到物理页，K/V
-分别位于 `kv_cache[page, 0]` 和 `kv_cache[page, 1]`。
+K/V 分别位于最后一维的前半段和后半段。
 
 ## 文件
 

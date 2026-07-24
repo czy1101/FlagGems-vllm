@@ -77,7 +77,7 @@ def main():
             if run_vllm:
                 def run_vllm_fn():
                     vllm_decode(q, idx_q, kv_cache, index_kv_cache, block_table, cu_q, sl,
-                               seq_len, n_kv_h, args.topk, args.init_blocks, args.local_blocks, sm_scale, args.decode_qlen)
+                               seq_len, n_kv_h, args.topk, args.init_blocks, args.local_blocks, sm_scale, args.decode_qlen, output=out)
                 lat_vllm = bench_fn(run_vllm_fn, args.warmup, args.rep)
         else:
             data = make_data(batch, seq_len, n_kv_h, n_h, device, dtype)
@@ -95,7 +95,7 @@ def main():
             if run_vllm:
                 def run_vllm_fn():
                     vllm_prefill(q, idx_q, kv_cache, index_kv_cache, block_table, cu_q, sl, pl,
-                                seq_len, n_kv_h, args.topk, args.init_blocks, args.local_blocks, sm_scale)
+                                seq_len, n_kv_h, args.topk, args.init_blocks, args.local_blocks, sm_scale, output=out)
                 lat_vllm = bench_fn(run_vllm_fn, args.warmup, args.rep)
 
         speedup = lat_vllm / lat_triton if (lat_triton > 0 and lat_vllm is not None) else 0

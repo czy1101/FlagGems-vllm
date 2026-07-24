@@ -1,6 +1,6 @@
 """PyTorch reference for MSA pipeline (paged KV cache format).
 
-kv_cache: [num_blocks, 2, 128, num_kv_heads, head_dim]  K=[:,0] V=[:,1]
+kv_cache: [num_blocks, num_kv_heads, 128, 2*head_dim]  K=[:,0] V=[:,1]
 index_kv_cache: [num_blocks, 128, head_dim]
 block_table: [batch, max_blocks]
 """
@@ -88,7 +88,7 @@ def ref_sparse_attn(q, kv_cache, topk_idx, block_table, cu_seqlens_q,
     """Sparse attention over selected blocks (paged KV)."""
     batch = cu_seqlens_q.shape[0] - 1
     total_q, num_heads, head_dim = q.shape
-    num_kv_heads = kv_cache.shape[3]
+    num_kv_heads = kv_cache.shape[1]
     gqa_group_size = num_heads // num_kv_heads
     output = torch.zeros_like(q)
     for b in range(batch):
@@ -115,8 +115,8 @@ def ref_sparse_attn(q, kv_cache, topk_idx, block_table, cu_seqlens_q,
                     bs = blk_i * BLOCK
                     be = min(bs + BLOCK, max_k)
                     page = block_table[b, blk_i].item()
-                    k_chunks.append(kv_cache[page, 0, :be - bs, kv_hi].float())
-                    v_chunks.append(kv_cache[page, 1, :be - bs, kv_hi].float())
+                    k_chunks.append(kv_cache[page, kv_hi, :be - bs, :head_dim].float())
+                    v_chunks.append(kv_cache[page, kv_hi, :be - bs, head_dim:].float())
                 k_cat = torch.cat(k_chunks, dim=0)
                 v_cat = torch.cat(v_chunks, dim=0)
                 hi_start = kv_hi * gqa_group_size
@@ -183,7 +183,7 @@ def ref_sparse_attn_decode(q, kv_cache, topk_idx, block_table, seq_lens,
     """Decode sparse attention (paged)."""
     num_reqs = seq_lens.shape[0]
     total_q, num_heads, head_dim = q.shape
-    num_kv_heads = kv_cache.shape[3]
+    num_kv_heads = kv_cache.shape[1]
     gqa_group_size = num_heads // num_kv_heads
     output = torch.zeros_like(q)
     for r in range(num_reqs):
@@ -205,8 +205,8 @@ def ref_sparse_attn_decode(q, kv_cache, topk_idx, block_table, seq_lens,
                     bs = blk_i * BLOCK
                     be = min(bs + BLOCK, kv_len)
                     page = block_table[r, blk_i].item()
-                    k_chunks.append(kv_cache[page, 0, :be - bs, kv_hi].float())
-                    v_chunks.append(kv_cache[page, 1, :be - bs, kv_hi].float())
+                    k_chunks.append(kv_cache[page, kv_hi, :be - bs, :head_dim].float())
+                    v_chunks.append(kv_cache[page, kv_hi, :be - bs, head_dim:].float())
                 k_cat = torch.cat(k_chunks, dim=0)
                 v_cat = torch.cat(v_chunks, dim=0)
                 hi_start = kv_hi * gqa_group_size
