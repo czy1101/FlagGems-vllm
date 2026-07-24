@@ -1,7 +1,11 @@
-"""Adapter: call sglang's MSA Triton kernels using paged KV cache.
+"""Adapter for sglang's MiniMax MSA kernels.
 
-Our paged:   kv_cache [num_blocks, 2, 128, H, D], index_kv_cache [num_blocks, 128, D]
-sglang:      k_cache [total_kv, H, D], req_to_token [batch, max_kv_len], slot_ids [batch]
+The benchmark uses vLLM's paged cache layout:
+  kv_cache [num_blocks, num_kv_heads, 128, 2 * head_dim]
+  index_kv_cache [num_blocks, 128, head_dim]
+
+sglang uses flattened token-major K/V caches and a request-to-token table, so
+the page layout is converted once before timing the kernel calls.
 """
 import os
 import sys
@@ -26,15 +30,43 @@ _cached_sglang_inputs = None
 
 def _paged_to_sglang(kv_cache, index_kv_cache, block_table, batch, seq_len):
     num_blocks = kv_cache.shape[0]
-    num_kv_heads = kv_cache.shape[3]
-    head_dim = kv_cache.shape[4]
+    num_kv_heads = kv_cache.shape[1]
+    block_size = kv_cache.shape[2]
+    packed_dim = kv_cache.shape[3]
+    if block_size != SPARSE_BLOCK_SIZE or packed_dim % 2:
+        raise ValueError(
+            "Expected kv_cache shape "
+            "[num_blocks, num_kv_heads, 128, 2 * head_dim], got "
+            f"{tuple(kv_cache.shape)}"
+        )
+    head_dim = packed_dim // 2
+    expected_index_shape = (num_blocks, block_size, head_dim)
+    if tuple(index_kv_cache.shape) != expected_index_shape:
+        raise ValueError(
+            "Expected index_kv_cache shape "
+            f"{expected_index_shape}, got {tuple(index_kv_cache.shape)}"
+        )
     blocks_per_batch = (seq_len + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE
     total_kv = num_blocks * SPARSE_BLOCK_SIZE
     max_kv_len = blocks_per_batch * SPARSE_BLOCK_SIZE
 
-    k_cache = kv_cache[:, 0].reshape(total_kv, num_kv_heads, head_dim).contiguous()
-    v_cache = kv_cache[:, 1].reshape(total_kv, num_kv_heads, head_dim).contiguous()
-    idx_k_cache = index_kv_cache.reshape(total_kv, 1, head_dim).contiguous()
+    # vLLM stores heads before tokens inside each page. sglang indexes a
+    # flattened token-major cache: [page * block_size + token, head, dim].
+    k_cache = (
+        kv_cache[..., :head_dim]
+        .permute(0, 2, 1, 3)
+        .reshape(total_kv, num_kv_heads, head_dim)
+        .contiguous()
+    )
+    v_cache = (
+        kv_cache[..., head_dim:]
+        .permute(0, 2, 1, 3)
+        .reshape(total_kv, num_kv_heads, head_dim)
+        .contiguous()
+    )
+    idx_k_cache = (
+        index_kv_cache.reshape(total_kv, 1, head_dim).contiguous()
+    )
 
     token_offsets = torch.arange(
         SPARSE_BLOCK_SIZE, device=kv_cache.device, dtype=torch.int64

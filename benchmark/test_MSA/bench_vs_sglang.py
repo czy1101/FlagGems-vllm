@@ -5,6 +5,10 @@ Usage:
   python -m benchmark.test_MSA.bench_vs_sglang --all-shapes --per-step --no-sglang
   python -m benchmark.test_MSA.bench_vs_sglang --all-shapes
   python -m benchmark.test_MSA.bench_vs_sglang --decode --all-shapes
+
+The sglang adapter converts the shared vLLM-style paged cache outside the
+timed region. Per-step columns therefore describe FlagGems' internal stages;
+the sglang column measures its complete MSA call.
 """
 import sys
 import argparse
