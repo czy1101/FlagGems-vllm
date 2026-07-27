@@ -9,10 +9,11 @@
 # Heavily modified from fla/ops/gated_oja_rule/chunk.py.
 """Wall training/prefill kernels: forward, backward, and the autograd Function."""
 
-# Adapted for FlagGems-vllm submission (v0).
+# Adapted for FlagGems-vllm submission (v1).
 # This module has no runtime dependency on the source FLA repository.
 
 import os
+from functools import cache
 
 import torch
 import triton
@@ -36,6 +37,17 @@ def log2(x):
 from flaggems_vllm.ops.FLA.utils import check_shared_mem, input_guard
 
 _DEBUG_ASSERTS = os.environ.get("WALL_ATTN_DEBUG", "0") == "1"
+
+
+@cache
+def _is_nvidia_hopper_device(device_index: int) -> bool:
+    """Return whether a CUDA device is NVIDIA Hopper."""
+
+    return (
+        torch.version.hip is None
+        and torch.cuda.get_device_capability(device_index)[0] == 9
+    )
+
 
 # Set WALL_ATTN_DKV_DIAG_BF16=0 to force fp32 tensor cores in the diagonal loop
 # of parallel_wall_attn_bwd_kernel_dkv (precision over speed).
@@ -97,6 +109,7 @@ def parallel_wall_attn_fwd_kernel(
     USE_WINDOW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_SCALAR_G: tl.constexpr,
+    USE_TF32_DIAG_DOT: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -196,7 +209,20 @@ def parallel_wall_attn_fwd_kernel(
         # q_til in local frame; clamp exp for Q before sub-block (masked by causality).
         b_exp_q = tl.minimum(b_pq - b_R_local_bc, tl.zeros([BT, BK], dtype=tl.float32))
         b_q_til_local = b_q.to(tl.float32) * exp2(b_exp_q)
-        b_s = tl.dot(b_q_til_local, b_k_til) * scale * RCP_LN2
+
+        if USE_TF32_DIAG_DOT:
+            b_s = tl.dot(
+                b_q_til_local,
+                b_k_til,
+                input_precision="tf32",
+            ) * scale * RCP_LN2
+        else:
+            # Preserve the original precision behavior on non-Hopper
+            # devices and for non-BF16 inputs.
+            b_s = tl.dot(
+                b_q_til_local,
+                b_k_til,
+            ) * scale * RCP_LN2
 
         if USE_SCALAR_G:
             b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
@@ -601,6 +627,18 @@ def parallel_wall_attn_fwd(
         raise ValueError("`g_cumsum` must be contiguous in the last (K) dimension")
     g_cumsum = g_cumsum.contiguous()
 
+    device_index = (
+        q.device.index
+        if q.device.index is not None
+        else torch.cuda.current_device()
+    )
+    use_tf32_diag_dot = (
+        _is_nvidia_hopper_device(device_index)
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+    )
+
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
     G = HQ // H
@@ -638,7 +676,9 @@ def parallel_wall_attn_fwd(
             g_cumsum=g_cumsum, g_scalar_cumsum=g_scalar_cumsum, sink_bias=sink_bias,
             lse=lse, scale=scale, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
             B=B, T=T, W=window_size, H=H, HQ=HQ, G=G, K=K, V=V,
-            BT=BT, BS=BS, BK=BK, BV=BV, num_warps=num_warps, num_stages=num_stages,
+            BT=BT, BS=BS, BK=BK, BV=BV,
+            USE_TF32_DIAG_DOT=use_tf32_diag_dot,
+            num_warps=num_warps, num_stages=num_stages,
         )
         return o, lse
 
@@ -669,6 +709,7 @@ def parallel_wall_attn_fwd(
         V=V,
         BK=BK,
         BV=BV,
+        USE_TF32_DIAG_DOT=use_tf32_diag_dot,
     )
     return o, lse
 
