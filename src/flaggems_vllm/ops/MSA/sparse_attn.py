@@ -18,10 +18,10 @@ leaves the prefill kernels (which parallelize over the query dim) idle.
 """
 
 import torch
-
-from .utils import current_platform
 import triton
 import triton.language as tl
+
+from .utils import current_platform
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128

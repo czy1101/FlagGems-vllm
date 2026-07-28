@@ -15,11 +15,10 @@ feed the block-sparse attention kernels in ``sparse_attn``.
 """
 
 import torch
-
-from .utils import current_platform
 import triton
 import triton.language as tl
-from .utils import round_up
+
+from .utils import current_platform, round_up
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -663,9 +662,9 @@ def minimax_m3_index_score(
     max over a 128-token index-K block. M3 has num_idx_heads == num_kv_heads.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert num_idx_heads == num_kv_heads, (
-        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    )
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
 
@@ -780,9 +779,9 @@ def minimax_m3_index_decode_score(
     with the prefill side and run a single top-k over both.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert num_idx_heads == num_kv_heads, (
-        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    )
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     assert decode_query_len <= max_decode_query_len
     assert total_q == seq_lens.shape[0] * decode_query_len
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)

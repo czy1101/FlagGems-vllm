@@ -13,7 +13,6 @@ import inspect
 import sys
 import warnings
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable
 
 import torch
@@ -21,17 +20,29 @@ import triton
 import triton.knobs
 import triton.testing as triton_testing
 
-warnings.filterwarnings("ignore", message="tl.make_block_ptr is deprecated")
-triton.knobs.autotuning.adjust_block_size = False
+from flaggems_vllm.ops.MSA import (
+    SPARSE_BLOCK_SIZE,
+    minimax_m3_index_decode,
+    minimax_m3_index_score,
+    minimax_m3_index_topk,
+    minimax_m3_sparse_attn,
+    minimax_m3_sparse_attn_decode,
+)
 
 try:
     from vllm.models.minimax_m3.common.ops.index_topk import (
         minimax_m3_index_decode as vllm_index_decode,
+    )
+    from vllm.models.minimax_m3.common.ops.index_topk import (
         minimax_m3_index_score as vllm_index_score,
+    )
+    from vllm.models.minimax_m3.common.ops.index_topk import (
         minimax_m3_index_topk as vllm_index_topk,
     )
     from vllm.models.minimax_m3.common.ops.sparse_attn import (
         minimax_m3_sparse_attn as vllm_sparse_attn,
+    )
+    from vllm.models.minimax_m3.common.ops.sparse_attn import (
         minimax_m3_sparse_attn_decode as vllm_sparse_attn_decode,
     )
 
@@ -41,19 +52,8 @@ except Exception as exc:  # vLLM is an optional benchmark baseline.
     VLLM_AVAILABLE = False
     VLLM_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_SRC_ROOT = _REPO_ROOT / "src"
-if str(_SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SRC_ROOT))
-
-from flaggems_vllm.ops.MSA import ( 
-    SPARSE_BLOCK_SIZE,
-    minimax_m3_index_decode,
-    minimax_m3_index_score,
-    minimax_m3_index_topk,
-    minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
-)
+warnings.filterwarnings("ignore", message="tl.make_block_ptr is deprecated")
+triton.knobs.autotuning.adjust_block_size = False
 
 
 class _CachedPlatform:
@@ -192,12 +192,15 @@ def make_data(
     total_blocks = batch * blocks_per_request
     total_q = batch * decode_qlen if decode else batch * seq_len
 
-    q = torch.randn(
-        (total_q, num_heads, HEAD_DIM),
-        device=device,
-        dtype=torch.bfloat16,
-        generator=generator,
-    ) * 0.5
+    q = (
+        torch.randn(
+            (total_q, num_heads, HEAD_DIM),
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 0.5
+    )
     idx_q = _random_storage(
         (total_q, num_kv_heads, HEAD_DIM),
         device,
@@ -230,19 +233,17 @@ def make_data(
         device=device,
         dtype=storage_dtype,
     )
-    k_paged = k_cont.reshape(
-        total_blocks, BLOCK, num_kv_heads, HEAD_DIM
-    ).permute(0, 2, 1, 3)
-    v_paged = v_cont.reshape(
-        total_blocks, BLOCK, num_kv_heads, HEAD_DIM
-    ).permute(0, 2, 1, 3)
+    k_paged = k_cont.reshape(total_blocks, BLOCK, num_kv_heads, HEAD_DIM).permute(
+        0, 2, 1, 3
+    )
+    v_paged = v_cont.reshape(total_blocks, BLOCK, num_kv_heads, HEAD_DIM).permute(
+        0, 2, 1, 3
+    )
     kv_cache[..., :HEAD_DIM] = k_paged
     kv_cache[..., HEAD_DIM:] = v_paged
     index_kv_cache = index_k_cont.reshape(total_blocks, BLOCK, HEAD_DIM)
 
-    physical_pages = torch.randperm(
-        total_blocks, device=device, generator=generator
-    )
+    physical_pages = torch.randperm(total_blocks, device=device, generator=generator)
     if not randomize_pages:
         physical_pages = torch.arange(total_blocks, device=device)
     block_table = physical_pages.reshape(batch, blocks_per_request).to(torch.int32)
@@ -404,9 +405,7 @@ def bench_fn(fn: Callable, warmup: int, rep: int) -> float:
         fn()
     torch.cuda.synchronize()
     return float(
-        triton_testing.do_bench(
-            fn, warmup=warmup, rep=rep, return_mode="median"
-        )
+        triton_testing.do_bench(fn, warmup=warmup, rep=rep, return_mode="median")
     )
 
 
@@ -418,8 +417,10 @@ def _supports_fp8_scales() -> bool:
         decode_params = inspect.signature(vllm_sparse_attn_decode).parameters
     except (TypeError, ValueError):
         return False
-    return "k_scale" in prefill_params and "v_scale" in prefill_params and (
-        "k_scale" in decode_params and "v_scale" in decode_params
+    return (
+        "k_scale" in prefill_params
+        and "v_scale" in prefill_params
+        and ("k_scale" in decode_params and "v_scale" in decode_params)
     )
 
 
@@ -432,6 +433,7 @@ def _bench_steps(
     batch, seq_len, num_kv_heads, _ = shape
     output = torch.empty_like(data.q)
     if decode:
+
         def index_decode() -> torch.Tensor:
             return minimax_m3_index_decode(
                 data.idx_q,
@@ -576,9 +578,7 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
         if args.decode:
             headers.extend([("IdxDec(ms)", 11), ("AttnDec(ms)", 11)])
         else:
-            headers.extend(
-                [("Score(ms)", 10), ("TopK(ms)", 10), ("Attn(ms)", 10)]
-            )
+            headers.extend([("Score(ms)", 10), ("TopK(ms)", 10), ("Attn(ms)", 10)])
     separator = "-" * len(_format_columns(headers))
     print(separator)
     print(_format_columns(headers))
@@ -589,8 +589,7 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
         batch, seq_len, num_kv_heads, num_heads = shape
         if num_heads % num_kv_heads != 0:
             raise ValueError(
-                f"Invalid shape {shape}: num_heads must be divisible by "
-                "num_kv_heads"
+                f"Invalid shape {shape}: num_heads must be divisible by " "num_kv_heads"
             )
         if args.decode and args.decode_qlen > seq_len:
             raise ValueError(
@@ -599,9 +598,7 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
             )
 
         generator = torch.Generator(device=device)
-        generator.manual_seed(
-            args.seed + shape_index + (100_000 if args.decode else 0)
-        )
+        generator.manual_seed(args.seed + shape_index + (100_000 if args.decode else 0))
         data = make_data(
             batch,
             seq_len,
@@ -681,21 +678,14 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
                 else (("vllm", vllm_run), ("flaggems", flaggems_run))
             )
             timings = {
-                name: bench_fn(fn, args.warmup, args.rep)
-                for name, fn in providers
+                name: bench_fn(fn, args.warmup, args.rep) for name, fn in providers
             }
             flaggems_ms = timings["flaggems"]
             vllm_ms = timings["vllm"]
         else:
-            flaggems_ms = bench_fn(
-                flaggems_run, args.warmup, args.rep
-            )
+            flaggems_ms = bench_fn(flaggems_run, args.warmup, args.rep)
 
-        steps = (
-            _bench_steps(data, args.decode, args, shape)
-            if args.per_step
-            else {}
-        )
+        steps = _bench_steps(data, args.decode, args, shape) if args.per_step else {}
         row = [
             (f"{batch}x{seq_len}x{num_kv_heads}x{num_heads}", 22),
             (f"{flaggems_ms:.4f}", 13),
@@ -727,7 +717,7 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
         sys.stdout.flush()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="bf16")
     parser.add_argument("--shape", default=None)
@@ -739,17 +729,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--identity-pages", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--prefill-only", action="store_true")
-    mode.add_argument("--decode-only", "--decode", dest="decode_only", action="store_true")
+    mode.add_argument(
+        "--decode-only", "--decode", dest="decode_only", action="store_true"
+    )
     parser.add_argument("--decode-qlen", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--rep", type=int, default=DEFAULT_REP)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-vllm", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def run_benchmark(args: argparse.Namespace) -> None:
     _require_cuda()
     if args.decode_qlen < 1:
         raise ValueError("--decode-qlen must be positive")
@@ -773,9 +764,7 @@ def main() -> None:
     dtypes = (
         ("bf16", "fp8")
         if args.dtype == "both" and _supports_fp8()
-        else ("bf16",)
-        if args.dtype == "both"
-        else (args.dtype,)
+        else ("bf16",) if args.dtype == "both" else (args.dtype,)
     )
 
     if args.no_vllm:
@@ -791,6 +780,19 @@ def main() -> None:
             print()
         for dtype_name in dtypes:
             _run_dtype(args, dtype_name)
+
+
+def test_msa_benchmark(request) -> None:
+    """Run the MSA benchmark through pytest using benchmark CLI timing options."""
+    args = parse_args([])
+    args.warmup = int(request.config.getoption("--warmup"))
+    args.rep = int(request.config.getoption("--iter"))
+    args.per_step = True
+    run_benchmark(args)
+
+
+def main() -> None:
+    run_benchmark(parse_args())
 
 
 if __name__ == "__main__":

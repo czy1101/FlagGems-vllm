@@ -3,20 +3,14 @@
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Sequence
-import triton.knobs
-triton.knobs.autotuning.adjust_block_size = False
+
 import pytest
 import torch
+import triton.knobs
 
-_SRC_ROOT = Path(__file__).resolve().parents[2] / "src"
-if str(_SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SRC_ROOT))
-
-from flaggems_vllm.ops.MSA import ( 
+from flaggems_vllm.ops.MSA import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
     minimax_m3_index_score,
@@ -25,6 +19,7 @@ from flaggems_vllm.ops.MSA import (
     minimax_m3_sparse_attn_decode,
 )
 
+triton.knobs.autotuning.adjust_block_size = False
 BLOCK = SPARSE_BLOCK_SIZE
 HEAD_DIM = 128
 FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
@@ -113,14 +108,12 @@ def make_data(
         query_lens = (decode_qlen,) * batch
         prefix_values = (0,) * batch
     else:
-        prefix_values = (
-            tuple(prefix_lens)
-            if prefix_lens is not None
-            else (0,) * batch
-        )
+        prefix_values = tuple(prefix_lens) if prefix_lens is not None else (0,) * batch
         if len(prefix_values) != batch:
             raise ValueError("prefix_lens and seq_lens must have equal lengths")
-        if any(prefix < 0 or prefix >= seq for prefix, seq in zip(prefix_values, seq_lens)):
+        if any(
+            prefix < 0 or prefix >= seq for prefix, seq in zip(prefix_values, seq_lens)
+        ):
             raise ValueError("each prefix length must be in [0, seq_len)")
         query_lens = tuple(seq - prefix for seq, prefix in zip(seq_lens, prefix_values))
 
@@ -132,16 +125,13 @@ def make_data(
     kv_fp8 = mode in {"fp8_kv", "fp8_full"}
     kv_scale_value = 0.5
 
-    q = torch.randn(
-        (total_q, num_heads, HEAD_DIM), device=device, dtype=torch.bfloat16
-    ) * 0.5
-    idx_q = _storage(
-        (total_q, num_kv_heads, HEAD_DIM), device, index_fp8
+    q = (
+        torch.randn((total_q, num_heads, HEAD_DIM), device=device, dtype=torch.bfloat16)
+        * 0.5
     )
+    idx_q = _storage((total_q, num_kv_heads, HEAD_DIM), device, index_fp8)
 
-    blocks_per_request = [
-        (seq + BLOCK - 1) // BLOCK for seq in seq_lens
-    ]
+    blocks_per_request = [(seq + BLOCK - 1) // BLOCK for seq in seq_lens]
     total_blocks = sum(blocks_per_request)
     max_blocks = max(blocks_per_request)
     logical_kv = torch.empty(
@@ -161,12 +151,12 @@ def make_data(
         kv_fp8,
         kv_scale_value,
     )
-    logical_k = logical_k.reshape(
-        total_blocks, BLOCK, num_kv_heads, HEAD_DIM
-    ).permute(0, 2, 1, 3)
-    logical_v = logical_v.reshape(
-        total_blocks, BLOCK, num_kv_heads, HEAD_DIM
-    ).permute(0, 2, 1, 3)
+    logical_k = logical_k.reshape(total_blocks, BLOCK, num_kv_heads, HEAD_DIM).permute(
+        0, 2, 1, 3
+    )
+    logical_v = logical_v.reshape(total_blocks, BLOCK, num_kv_heads, HEAD_DIM).permute(
+        0, 2, 1, 3
+    )
     logical_kv[..., :HEAD_DIM] = logical_k
     logical_kv[..., HEAD_DIM:] = logical_v
 
@@ -174,14 +164,10 @@ def make_data(
         (total_blocks * BLOCK, HEAD_DIM), device, index_fp8
     ).reshape(total_blocks, BLOCK, HEAD_DIM)
     physical_pages = torch.randperm(total_blocks, device=device)
-    block_table = torch.zeros(
-        (batch, max_blocks), device=device, dtype=torch.int32
-    )
+    block_table = torch.zeros((batch, max_blocks), device=device, dtype=torch.int32)
     offset = 0
     for request, num_blocks in enumerate(blocks_per_request):
-        block_table[request, :num_blocks] = physical_pages[
-            offset : offset + num_blocks
-        ]
+        block_table[request, :num_blocks] = physical_pages[offset : offset + num_blocks]
         offset += num_blocks
 
     kv_cache = torch.empty_like(logical_kv)
@@ -195,9 +181,7 @@ def make_data(
         dtype=torch.int32,
     )
     seq_lens_tensor = torch.tensor(seq_lens, device=device, dtype=torch.int32)
-    prefix_lens_tensor = torch.tensor(
-        prefix_values, device=device, dtype=torch.int32
-    )
+    prefix_lens_tensor = torch.tensor(prefix_values, device=device, dtype=torch.int32)
     if kv_fp8:
         k_scale = torch.tensor([kv_scale_value], device=device, dtype=torch.float32)
         v_scale = torch.tensor([kv_scale_value], device=device, dtype=torch.float32)
@@ -247,9 +231,7 @@ def _ref_index_score(data: MSAData) -> torch.Tensor:
                 block * BLOCK + valid_tokens,
                 device=data.q.device,
             )
-            query_positions = (
-                torch.arange(query_len, device=data.q.device) + prefix_len
-            )
+            query_positions = torch.arange(query_len, device=data.q.device) + prefix_len
             causal = key_positions[None, :] <= query_positions[:, None]
             qk = qk.masked_fill(~causal[:, None, :], float("-inf"))
             scores[:, q_start:q_end, block] = qk.amax(dim=-1).transpose(0, 1)
@@ -306,9 +288,7 @@ def _dequantized_kv(
     return keys, values
 
 
-def _ref_sparse_attn(
-    data: MSAData, topk_idx: torch.Tensor
-) -> torch.Tensor:
+def _ref_sparse_attn(data: MSAData, topk_idx: torch.Tensor) -> torch.Tensor:
     output = torch.zeros_like(data.q)
     num_kv_heads = data.kv_cache.shape[1]
     group_size = data.q.shape[1] // num_kv_heads
@@ -330,9 +310,7 @@ def _ref_sparse_attn(
                     if valid_tokens <= 0:
                         continue
                     page = int(data.block_table[request, block].item())
-                    keys, values = _dequantized_kv(
-                        data, page, kv_head, valid_tokens
-                    )
+                    keys, values = _dequantized_kv(data, page, kv_head, valid_tokens)
                     keys_parts.append(keys)
                     values_parts.append(values)
                 if not keys_parts:
@@ -344,14 +322,15 @@ def _ref_sparse_attn(
                 query = data.q[query_id, head_start:head_end].float()
                 logits = (query @ keys.transpose(0, 1)) * data.sm_scale
                 weights = torch.softmax(logits, dim=-1)
-                output[query_id, head_start:head_end] = (
-                    weights @ values
-                ).to(output.dtype)
+                output[query_id, head_start:head_end] = (weights @ values).to(
+                    output.dtype
+                )
     return output
 
 
-def _ref_decode_index(data: MSAData, topk: int, init_blocks: int, local_blocks: int,
-                      decode_qlen: int) -> torch.Tensor:
+def _ref_decode_index(
+    data: MSAData, topk: int, init_blocks: int, local_blocks: int, decode_qlen: int
+) -> torch.Tensor:
     num_requests = len(data.query_lens)
     num_idx_heads = data.idx_q.shape[1]
     max_blocks = (data.max_seq_len + BLOCK - 1) // BLOCK
@@ -393,14 +372,17 @@ def _ref_decode_index(data: MSAData, topk: int, init_blocks: int, local_blocks: 
             query_pos = seq_len - decode_qlen + query_index
             valid_blocks = (query_pos + BLOCK) // BLOCK
             num_selected = min(topk, valid_blocks)
-            result[:, query_id, :num_selected] = scores[
-                :, query_id, :valid_blocks
-            ].topk(num_selected, dim=-1).indices.to(torch.int32)
+            result[:, query_id, :num_selected] = (
+                scores[:, query_id, :valid_blocks]
+                .topk(num_selected, dim=-1)
+                .indices.to(torch.int32)
+            )
     return result
 
 
-def _ref_decode_attn(data: MSAData, topk_idx: torch.Tensor,
-                     decode_qlen: int) -> torch.Tensor:
+def _ref_decode_attn(
+    data: MSAData, topk_idx: torch.Tensor, decode_qlen: int
+) -> torch.Tensor:
     output = torch.zeros_like(data.q)
     num_requests = len(data.query_lens)
     num_kv_heads = data.kv_cache.shape[1]
@@ -422,9 +404,7 @@ def _ref_decode_attn(data: MSAData, topk_idx: torch.Tensor,
                     if valid_tokens <= 0:
                         continue
                     page = int(data.block_table[request, block].item())
-                    keys, values = _dequantized_kv(
-                        data, page, kv_head, valid_tokens
-                    )
+                    keys, values = _dequantized_kv(data, page, kv_head, valid_tokens)
                     keys_parts.append(keys)
                     values_parts.append(values)
                 if not keys_parts:
@@ -436,14 +416,15 @@ def _ref_decode_attn(data: MSAData, topk_idx: torch.Tensor,
                 query = data.q[query_id, head_start:head_end].float()
                 logits = (query @ keys.transpose(0, 1)) * data.sm_scale
                 weights = torch.softmax(logits, dim=-1)
-                output[query_id, head_start:head_end] = (
-                    weights @ values
-                ).to(output.dtype)
+                output[query_id, head_start:head_end] = (weights @ values).to(
+                    output.dtype
+                )
     return output
 
 
-def _assert_score_match(actual: torch.Tensor, expected: torch.Tensor,
-                        data: MSAData, decode: bool) -> None:
+def _assert_score_match(
+    actual: torch.Tensor, expected: torch.Tensor, data: MSAData, decode: bool
+) -> None:
     atol = FP8_SCORE_ATOL if data.idx_q.dtype == FP8_DTYPE else BF16_SCORE_ATOL
     rtol = FP8_SCORE_RTOL if data.idx_q.dtype == FP8_DTYPE else BF16_SCORE_RTOL
     for request, query_len in enumerate(data.query_lens):
@@ -463,8 +444,9 @@ def _assert_score_match(actual: torch.Tensor, expected: torch.Tensor,
             )
 
 
-def _assert_topk_match(actual: torch.Tensor, expected: torch.Tensor,
-                       data: MSAData, topk: int, decode: bool) -> None:
+def _assert_topk_match(
+    actual: torch.Tensor, expected: torch.Tensor, data: MSAData, topk: int, decode: bool
+) -> None:
     for request, query_len in enumerate(data.query_lens):
         q_start = int(data.cu_q[request].item())
         for query_index in range(query_len):
@@ -487,8 +469,9 @@ def _assert_topk_match(actual: torch.Tensor, expected: torch.Tensor,
                 )
 
 
-def _assert_attention_match(actual: torch.Tensor, expected: torch.Tensor,
-                            data: MSAData) -> None:
+def _assert_attention_match(
+    actual: torch.Tensor, expected: torch.Tensor, data: MSAData
+) -> None:
     if not torch.isfinite(actual.float()).all():
         raise AssertionError("MSA output contains NaN or Inf")
     fp8 = data.k_scale is not None
@@ -566,7 +549,9 @@ def _run_prefill(case: tuple, mode: str) -> None:
 
 
 def _run_decode(case: tuple, mode: str) -> None:
-    seq_lens, num_kv_heads, group_size, topk, init_blocks, local_blocks, decode_qlen = case
+    seq_lens, num_kv_heads, group_size, topk, init_blocks, local_blocks, decode_qlen = (
+        case
+    )
     data = make_data(
         seq_lens,
         num_kv_heads,
@@ -625,12 +610,16 @@ DECODE_CASES = [
 ]
 
 
-@pytest.mark.parametrize("case", PREFILL_CASES, ids=("short", "ragged_prefix", "padded_batch"))
+@pytest.mark.parametrize(
+    "case", PREFILL_CASES, ids=("short", "ragged_prefix", "padded_batch")
+)
 def test_prefill_bf16(case: tuple) -> None:
     _run_prefill(case, "bf16")
 
 
-@pytest.mark.parametrize("case", DECODE_CASES, ids=("short", "spec_decode", "padded_batch"))
+@pytest.mark.parametrize(
+    "case", DECODE_CASES, ids=("short", "spec_decode", "padded_batch")
+)
 def test_decode_bf16(case: tuple) -> None:
     _run_decode(case, "bf16")
 
