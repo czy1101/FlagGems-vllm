@@ -56,13 +56,7 @@ class ParallaxCase:
     seq_lens: tuple[int, ...] | None = None
 
 
-# These cases preserve the dense, sliding-window and variable-length coverage
-# from the original improve_parallax tests. In particular, they exercise:
-#   * short, multi-tile and long sequences;
-#   * MHA and GQA;
-#   * non-power-of-two D and D=128;
-#   * window boundaries that are not tile-aligned;
-#   * single- and multi-sequence packed VarLen inputs.
+
 CASES = (
     # Dense causal.
     ParallaxCase(
@@ -217,7 +211,7 @@ def _reference_parallax(
     scale: float | None,
     window_size: int | None,
 ) -> torch.Tensor:
-    """FP32 PyTorch reference for one or more equal-length sequences."""
+
     B, T, HQ, D = q.shape
     H = k.shape[2]
     G = HQ // H
@@ -381,8 +375,6 @@ def _assert_close(
     if absolute_error <= abs_tolerance:
         return absolute_error, ratio
 
-    # Preserve the original FLA CI behavior: borderline numerical deviations
-    # can be reported as warnings in CI, while local runs remain strict.
     allow_ci_warning = FLA_CI_ENV and (
         ratio < 0.01 or absolute_error <= 0.3
     )
@@ -488,9 +480,7 @@ def test_parallel_parallax_forward_backward(
         device=flaggems_vllm.device,
     )
 
-    # Finish and release the much larger PyTorch reference graph before
-    # constructing the parallel_parallax graph. This follows the original
-    # reference-first validation order and substantially lowers peak memory.
+
     expected = _run_reference(case, reference_inputs)
     expected_output = expected.detach()
     expected_grads = tuple(
