@@ -1,50 +1,138 @@
-import ctypes
-import functools
-import os
-
-nvtx_lib = ctypes.CDLL("libnvToolsExt.so.1")
-
-# 改用 Start/End API（ncu 支持）
-nvtx_lib.nvtxRangeStartA.argtypes = [ctypes.c_char_p]
-nvtx_lib.nvtxRangeStartA.restype = ctypes.c_ulonglong  # 返回 range ID
-
-nvtx_lib.nvtxRangeEnd.argtypes = [ctypes.c_ulonglong]
-nvtx_lib.nvtxRangeEnd.restype = ctypes.c_int
-
-def nvtx_start(name):
-    return nvtx_lib.nvtxRangeStartA(name.encode('utf-8'))
-
-def nvtx_end(range_id):
-    nvtx_lib.nvtxRangeEnd(range_id)
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
-import torch.cuda.nvtx as nvtx
+
+import contextlib
+import functools
+import os
+from collections import deque
+
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
-from einops import reduce
 
+def _get_triton_backend() -> str:
+    try:
+        return triton.runtime.driver.active.get_current_target().backend
+    except Exception:
+        return 'cpu'
 
+_TRITON_BACKEND = _get_triton_backend()
+_TORCH_DEVICE = 'cuda' if _TRITON_BACKEND in ('cpu', 'cuda', 'hip') else _TRITON_BACKEND
+_TORCH_DEVICE_LIB = getattr(torch, _TORCH_DEVICE)
+IS_NVIDIA_BLACKWELL = (
+    _TRITON_BACKEND == 'cuda'
+    and torch.cuda.get_device_capability()[0] in (10, 12)
+)
+
+if hasattr(torch, 'amp') and hasattr(torch.amp, 'custom_fwd'):
+    autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=_TORCH_DEVICE)
+    autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=_TORCH_DEVICE)
+else:
+    autocast_custom_fwd = _TORCH_DEVICE_LIB.amp.custom_fwd
+    autocast_custom_bwd = _TORCH_DEVICE_LIB.amp.custom_bwd
+
+def _custom_device_ctx(index: int | None):
+    if index is None:
+        return contextlib.nullcontext()
+    try:
+        return _TORCH_DEVICE_LIB.device(index)
+    except (AttributeError, AssertionError, RuntimeError):
+        return contextlib.nullcontext()
+
+def contiguous(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        processed_args = tuple(arg.contiguous() if isinstance(arg, torch.Tensor) else arg for arg in args)
+        processed_kwargs = {
+            key: value.contiguous() if isinstance(value, torch.Tensor) else value
+            for key, value in kwargs.items()
+        }
+        tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
+        if tensor is None:
+            tensor = next((value for value in kwargs.values() if isinstance(value, torch.Tensor)), None)
+        ctx = _custom_device_ctx(tensor.device.index) if tensor is not None else contextlib.nullcontext()
+        with ctx:
+            return fn(*processed_args, **processed_kwargs)
+
+    return wrapper
+
+try:
+    _TENSOR_CACHE_SIZE = int(os.getenv('FLA_TENSOR_CACHE_SIZE', '4'))
+except ValueError:
+    _TENSOR_CACHE_SIZE = 4
+
+def _tensor_cache(fn):
+    cached = deque(maxlen=_TENSOR_CACHE_SIZE)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if os.getenv('FLA_DISABLE_TENSOR_CACHE', '0') == '1':
+            return fn(*args, **kwargs)
+        for cached_args, cached_kwargs, cached_result in cached:
+            if len(args) != len(cached_args) or len(kwargs) != len(cached_kwargs):
+                continue
+            args_match = all(a is b for a, b in zip(args, cached_args, strict=False))
+            kwargs_match = all(key in cached_kwargs and value is cached_kwargs[key] for key, value in kwargs.items())
+            if args_match and kwargs_match:
+                return cached_result
+        result = fn(*args, **kwargs)
+        cached.append((args, kwargs, result))
+        return result
+
+    return wrapper
+
+@_tensor_cache
+def _prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
+    return torch.diff(cu_seqlens)
+
+def _segmented_arange(counts: torch.LongTensor) -> tuple[torch.LongTensor, torch.LongTensor]:
+    seg_id = torch.repeat_interleave(
+        torch.arange(counts.numel(), device=counts.device, dtype=counts.dtype),
+        counts,
+    )
+    seg_start = F.pad(counts.cumsum(0), (1, 0))[:-1]
+    intra_idx = torch.arange(seg_id.shape[0], device=counts.device, dtype=counts.dtype) - seg_start[seg_id]
+    return seg_id, intra_idx
+
+@_tensor_cache
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
     cu_seqlens_cpu: torch.LongTensor | None = None,
 ) -> torch.LongTensor:
-    if cu_seqlens is None:
-        return None
     src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
-    lens = torch.diff(src)
-    chunk_counts = (lens + (chunk_size - 1)).div(chunk_size, rounding_mode='floor')
-    seg_id = torch.repeat_interleave(
-        torch.arange(chunk_counts.numel(), device=chunk_counts.device, dtype=chunk_counts.dtype),
-        chunk_counts,
-    )
-    seg_start = torch.nn.functional.pad(chunk_counts.cumsum(0), (1, 0))[:-1]
-    intra_chunk_idx = torch.arange(seg_id.shape[0], device=chunk_counts.device, dtype=chunk_counts.dtype) - seg_start[seg_id]
+    chunk_counts = (_prepare_lens(src) + (chunk_size - 1)).div(chunk_size, rounding_mode='floor')
+    seg_id, intra_chunk_idx = _segmented_arange(chunk_counts)
     return torch.stack([seg_id, intra_chunk_idx], 1).to(cu_seqlens)
 
+@functools.cache
+def _get_all_max_shared_mem() -> list[int]:
+    try:
+        return [
+            triton.runtime.driver.active.utils.get_device_properties(i)['max_shared_mem']
+            for i in range(_TORCH_DEVICE_LIB.device_count())
+        ]
+    except Exception:
+        return [-1]
+
+@functools.cache
+def check_shared_mem(arch: str = 'none', tensor_idx: int = 0) -> bool:
+    shared_mem_by_arch = {
+        'ada': 101376,
+        'ampere': 166912,
+        'hopper': 232448,
+    }
+    try:
+        max_shared_memory = _get_all_max_shared_mem()[tensor_idx]
+        return max_shared_memory >= shared_mem_by_arch.get(arch.lower(), 102400)
+    except Exception:
+        return False
 
 if os.environ.get('FLA_USE_FAST_OPS', '0') == '1':
     @triton.jit
@@ -55,43 +143,6 @@ else:
     def exp2(x):
         return tl.math.exp2(x.to(tl.float32))
 
-
-try:
-    IS_NVIDIA_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in (10, 12)
-except Exception:
-    IS_NVIDIA_BLACKWELL = False
-
-
-def check_shared_mem(arch: str = 'none', tensor_idx: int = 0) -> bool:
-    try:
-        max_shared_memory = triton.runtime.driver.active.utils.get_device_properties(tensor_idx)['max_shared_mem']
-        defaults = {'hopper': 232448, 'default': 102400}
-        return max_shared_memory >= defaults.get(arch.lower(), defaults['default'])
-    except Exception:
-        return False
-
-
-if hasattr(torch.amp, 'custom_fwd'):
-    autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type='cuda')
-    autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type='cuda')
-else:
-    def autocast_custom_fwd(fn):
-        return fn
-
-    def autocast_custom_bwd(fn):
-        return fn
-
-
-def contiguous(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        args = tuple(arg.contiguous() if isinstance(arg, torch.Tensor) else arg for arg in args)
-        kwargs = {k: (v.contiguous() if isinstance(v, torch.Tensor) else v) for k, v in kwargs.items()}
-        return fn(*args, **kwargs)
-
-    return wrapper
-
-
 def _block_size(head_dim: int, device_index: int) -> int:
     # A single square tile size shared by all kernels so one `chunk_indices`
     # (built host-side for varlen) matches every grid. Kept modest to bound the
@@ -99,7 +150,6 @@ def _block_size(head_dim: int, device_index: int) -> int:
     if check_shared_mem('hopper', device_index) and not IS_NVIDIA_BLACKWELL and head_dim <= 64:
         return 128
     return 64
-
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -277,7 +327,6 @@ def parallel_parallax_fwd_kernel(
     tl.store(p_bart, b_bart, boundary_check=(0, 1))
     tl.store(p_m, m_acc, boundary_check=(0, 1))
 
-
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -323,7 +372,6 @@ def parallel_parallax_bwd_kernel_preprocess(
 
     tl.store(p_t, b_t, boundary_check=(0, 1))
     tl.store(p_b, b_b, boundary_check=(0, 1))
-
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -495,7 +543,6 @@ def parallel_parallax_bwd_kernel_dqr(
 
     tl.store(p_grad_q, grad_q_acc.to(p_grad_q.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_grad_r, grad_r_acc.to(p_grad_r.dtype.element_ty), boundary_check=(0, 1))
-
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -718,7 +765,6 @@ def parallel_parallax_bwd_kernel_dkv(
     tl.store(p_grad_k, grad_k_acc.to(p_grad_k.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_grad_v, grad_v_acc.to(p_grad_v.dtype.element_ty), boundary_check=(0, 1))
 
-
 def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None, window_size_left=-1):
     """Parallax forward (Triton). `(B, T, HQ, D)` / packed `(1, T_total, HQ, D)` inputs.
 
@@ -738,9 +784,6 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
 
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     grid = (NT, B * HQ)
-    _range_id = nvtx_start(
-        f"PARALLAX_KERNEL|FWD|B{B}|T{T}|HQ{HQ}|H{H}|K{K}"
-    )
     parallel_parallax_fwd_kernel[grid](
         q, r, k, v, o, barv, d1, bart, m,
         scale, cu_seqlens, chunk_indices, T,
@@ -748,11 +791,24 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
         WINDOW_SIZE_LEFT=window_size_left, BT=BT, BS=BT,
         num_warps=8, num_stages=2,
     )
-    nvtx_end(_range_id)
     return o, barv, d1, bart, m
 
-
-def parallel_parallax_bwd(q, r, k, v, o, barv, d1, bart, m, grad_o, scale, cu_seqlens=None, chunk_indices=None, window_size_left=-1):
+def parallel_parallax_bwd(
+    q,
+    r,
+    k,
+    v,
+    o,
+    barv,
+    d1,
+    bart,
+    m,
+    grad_o,
+    scale,
+    cu_seqlens=None,
+    chunk_indices=None,
+    window_size_left=-1,
+):
     """Parallax backward (Triton). Returns grads matching `q, r, k, v`."""
     B, T, HQ, K = q.shape
     H = k.shape[2]
@@ -770,20 +826,13 @@ def parallel_parallax_bwd(q, r, k, v, o, barv, d1, bart, m, grad_o, scale, cu_se
 
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     grid = (NT, B * HQ)
-    _range_id = nvtx_start(
-        f"PARALLAX_KERNEL|BWD_PREPROCESS|B{B}|T{T}|HQ{HQ}|K{K}"
-    )
+
     parallel_parallax_bwd_kernel_preprocess[grid](
         grad_o, o, barv, delta_t, delta_b,
         cu_seqlens, chunk_indices, T,
         HQ=HQ, K=K, BK=BK, BT=BT,
         num_warps=4, num_stages=2,
     )
-    nvtx_end(_range_id)
-    _range_id = nvtx_start(
-        f"PARALLAX_KERNEL|BWD_DQR|B{B}|T{T}|HQ{HQ}|H{H}|K{K}"
-    )
-
     parallel_parallax_bwd_kernel_dqr[grid](
         q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
         scale, cu_seqlens, chunk_indices, T,
@@ -791,11 +840,6 @@ def parallel_parallax_bwd(q, r, k, v, o, barv, d1, bart, m, grad_o, scale, cu_se
         WINDOW_SIZE_LEFT=window_size_left, BT=BT, BS=BT,
         num_warps=8, num_stages=2,
     )
-    nvtx_end(_range_id)
-    _range_id = nvtx_start(
-        f"PARALLAX_KERNEL|BWD_DKV|B{B}|T{T}|HQ{HQ}|H{H}|K{K}"
-    )
-
     parallel_parallax_bwd_kernel_dkv[grid](
         q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k_buf, grad_v_buf,
         scale, cu_seqlens, chunk_indices, T,
@@ -803,15 +847,14 @@ def parallel_parallax_bwd(q, r, k, v, o, barv, d1, bart, m, grad_o, scale, cu_se
         WINDOW_SIZE_LEFT=window_size_left, BT=BT, BS=BT,
         num_warps=8, num_stages=2,
     )
-    nvtx_end(_range_id)
+
     if G == 1:
         grad_k = grad_k_buf
         grad_v = grad_v_buf
     else:
-        grad_k = reduce(grad_k_buf, 'b t (h g) k -> b t h k', g=G, reduction='sum')
-        grad_v = reduce(grad_v_buf, 'b t (h g) k -> b t h k', g=G, reduction='sum')
+        grad_k = grad_k_buf.reshape(B, T, H, G, K).sum(dim=3)
+        grad_v = grad_v_buf.reshape(B, T, H, G, K).sum(dim=3)
     return grad_q, grad_r, grad_k, grad_v
-
 
 class ParallaxFunction(torch.autograd.Function):
 
@@ -839,7 +882,6 @@ class ParallaxFunction(torch.autograd.Function):
             ctx.scale, ctx.cu_seqlens, ctx.chunk_indices, ctx.window_size_left,
         )
         return gq.to(q), gr.to(r), gk.to(k), gv.to(v), None, None, None
-
 
 def parallel_parallax(
     q: torch.Tensor,
