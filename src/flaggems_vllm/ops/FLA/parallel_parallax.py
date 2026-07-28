@@ -4,150 +4,61 @@
 # LICENSE file in the root directory of this source tree.
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
-
-import contextlib
-import functools
-import os
-from collections import deque
+ 
+from functools import lru_cache
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
-import triton.language.extra.libdevice as tldevice
+from einops import reduce
 
-def _get_triton_backend() -> str:
+from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
+from flaggems_vllm.ops.FLA.utils import input_guard
+
+@lru_cache(maxsize=None)
+def _get_available_device() -> str:
     try:
         return triton.runtime.driver.active.get_current_target().backend
     except Exception:
         return 'cpu'
 
-_TRITON_BACKEND = _get_triton_backend()
-_TORCH_DEVICE = 'cuda' if _TRITON_BACKEND in ('cpu', 'cuda', 'hip') else _TRITON_BACKEND
-_TORCH_DEVICE_LIB = getattr(torch, _TORCH_DEVICE)
+_DEVICE_PLATFORM = _get_available_device()
+IS_NVIDIA = (_DEVICE_PLATFORM == 'cuda')
 IS_NVIDIA_BLACKWELL = (
-    _TRITON_BACKEND == 'cuda'
+    IS_NVIDIA
     and torch.cuda.get_device_capability()[0] in (10, 12)
 )
 
-if hasattr(torch, 'amp') and hasattr(torch.amp, 'custom_fwd'):
-    autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=_TORCH_DEVICE)
-    autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=_TORCH_DEVICE)
-else:
-    autocast_custom_fwd = _TORCH_DEVICE_LIB.amp.custom_fwd
-    autocast_custom_bwd = _TORCH_DEVICE_LIB.amp.custom_bwd
+@triton.jit
+def exp2(x):
+    return tl.math.exp2(x.to(tl.float32))
 
-def _custom_device_ctx(index: int | None):
-    if index is None:
-        return contextlib.nullcontext()
+_SHARED_MEMORY_BY_ARCH = {
+    'ada': 101376,
+    'ampere': 166912,
+    'hopper': 232448,
+}
+
+@lru_cache(maxsize=None)
+def _check_shared_mem(arch: str = 'none', tensor_idx: int = 0) -> bool:
     try:
-        return _TORCH_DEVICE_LIB.device(index)
-    except (AttributeError, AssertionError, RuntimeError):
-        return contextlib.nullcontext()
-
-def contiguous(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        processed_args = tuple(arg.contiguous() if isinstance(arg, torch.Tensor) else arg for arg in args)
-        processed_kwargs = {
-            key: value.contiguous() if isinstance(value, torch.Tensor) else value
-            for key, value in kwargs.items()
-        }
-        tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
-        if tensor is None:
-            tensor = next((value for value in kwargs.values() if isinstance(value, torch.Tensor)), None)
-        ctx = _custom_device_ctx(tensor.device.index) if tensor is not None else contextlib.nullcontext()
-        with ctx:
-            return fn(*processed_args, **processed_kwargs)
-
-    return wrapper
-
-try:
-    _TENSOR_CACHE_SIZE = int(os.getenv('FLA_TENSOR_CACHE_SIZE', '4'))
-except ValueError:
-    _TENSOR_CACHE_SIZE = 4
-
-def _tensor_cache(fn):
-    cached = deque(maxlen=_TENSOR_CACHE_SIZE)
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        if os.getenv('FLA_DISABLE_TENSOR_CACHE', '0') == '1':
-            return fn(*args, **kwargs)
-        for cached_args, cached_kwargs, cached_result in cached:
-            if len(args) != len(cached_args) or len(kwargs) != len(cached_kwargs):
-                continue
-            args_match = all(a is b for a, b in zip(args, cached_args, strict=False))
-            kwargs_match = all(key in cached_kwargs and value is cached_kwargs[key] for key, value in kwargs.items())
-            if args_match and kwargs_match:
-                return cached_result
-        result = fn(*args, **kwargs)
-        cached.append((args, kwargs, result))
-        return result
-
-    return wrapper
-
-@_tensor_cache
-def _prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
-    return torch.diff(cu_seqlens)
-
-def _segmented_arange(counts: torch.LongTensor) -> tuple[torch.LongTensor, torch.LongTensor]:
-    seg_id = torch.repeat_interleave(
-        torch.arange(counts.numel(), device=counts.device, dtype=counts.dtype),
-        counts,
-    )
-    seg_start = F.pad(counts.cumsum(0), (1, 0))[:-1]
-    intra_idx = torch.arange(seg_id.shape[0], device=counts.device, dtype=counts.dtype) - seg_start[seg_id]
-    return seg_id, intra_idx
-
-@_tensor_cache
-def prepare_chunk_indices(
-    cu_seqlens: torch.LongTensor,
-    chunk_size: int,
-    cu_seqlens_cpu: torch.LongTensor | None = None,
-) -> torch.LongTensor:
-    src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
-    chunk_counts = (_prepare_lens(src) + (chunk_size - 1)).div(chunk_size, rounding_mode='floor')
-    seg_id, intra_chunk_idx = _segmented_arange(chunk_counts)
-    return torch.stack([seg_id, intra_chunk_idx], 1).to(cu_seqlens)
-
-@functools.cache
-def _get_all_max_shared_mem() -> list[int]:
-    try:
-        return [
-            triton.runtime.driver.active.utils.get_device_properties(i)['max_shared_mem']
-            for i in range(_TORCH_DEVICE_LIB.device_count())
-        ]
-    except Exception:
-        return [-1]
-
-@functools.cache
-def check_shared_mem(arch: str = 'none', tensor_idx: int = 0) -> bool:
-    shared_mem_by_arch = {
-        'ada': 101376,
-        'ampere': 166912,
-        'hopper': 232448,
-    }
-    try:
-        max_shared_memory = _get_all_max_shared_mem()[tensor_idx]
-        return max_shared_memory >= shared_mem_by_arch.get(arch.lower(), 102400)
+        properties = triton.runtime.driver.active.utils.get_device_properties(
+            tensor_idx,
+        )
+        max_shared_memory = properties['max_shared_mem']
+        required_shared_memory = _SHARED_MEMORY_BY_ARCH.get(
+            arch.lower(),
+            102400,
+        )
+        return max_shared_memory >= required_shared_memory
     except Exception:
         return False
-
-if os.environ.get('FLA_USE_FAST_OPS', '0') == '1':
-    @triton.jit
-    def exp2(x):
-        return tldevice.exp2(x.to(tl.float32))
-else:
-    @triton.jit
-    def exp2(x):
-        return tl.math.exp2(x.to(tl.float32))
 
 def _block_size(head_dim: int, device_index: int) -> int:
     # A single square tile size shared by all kernels so one `chunk_indices`
     # (built host-side for varlen) matches every grid. Kept modest to bound the
     # fp32 accumulator footprint Parallax carries (barv/Rv/grad accumulators).
-    if check_shared_mem('hopper', device_index) and not IS_NVIDIA_BLACKWELL and head_dim <= 64:
+    if _check_shared_mem('hopper', device_index) and not IS_NVIDIA_BLACKWELL and head_dim <= 64:
         return 128
     return 64
 
@@ -179,12 +90,12 @@ def parallel_parallax_fwd_kernel(
     BS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
@@ -212,18 +123,19 @@ def parallel_parallax_fwd_kernel(
     SAFE_MIDDLE_START = tl.maximum(FIRST_COL_BLOCK, SAFE_LEFT_START)
     RIGHT_BORDER_START = tl.maximum(FIRST_COL_BLOCK, NUM_SAFE_BLOCKS)
 
-    p_q = tl.make_block_ptr(q + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_r = tl.make_block_ptr(r + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (FIRST_COL_BLOCK * BS, 0), (BS, BK), (1, 0))
-    p_v = tl.make_block_ptr(v + (bos * H + i_h) * K, (T, K), (H * K, 1), (FIRST_COL_BLOCK * BS, 0), (BS, BK), (1, 0))
-    p_o = tl.make_block_ptr(o + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_barv = tl.make_block_ptr(barv + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_d1 = tl.make_block_ptr(d1 + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
-    p_bart = tl.make_block_ptr(bart + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
-    p_m = tl.make_block_ptr(m + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
+    o_k = tl.arange(0, BK)
+    m_k = o_k < K
+    m_qk = row_mask & m_k[None, :]
+    p_q = q + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+    p_r = r + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+    p_o = o + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+    p_barv = barv + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+    p_d1 = d1 + bos * HQ + i_hq + row_indices[:, None] * HQ
+    p_bart = bart + bos * HQ + i_hq + row_indices[:, None] * HQ
+    p_m = m + bos * HQ + i_hq + row_indices[:, None] * HQ
 
-    b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
-    b_r = tl.load(p_r, boundary_check=(0, 1), padding_option="zero")
+    b_q = tl.load(p_q, mask=m_qk, other=0.0)
+    b_r = tl.load(p_r, mask=m_qk, other=0.0)
     m_acc = tl.zeros((BT, 1), dtype=tl.float32) - float("inf")
     d1_acc = tl.zeros((BT, 1), dtype=tl.float32)
     d2_acc = tl.zeros((BT, 1), dtype=tl.float32)
@@ -233,9 +145,12 @@ def parallel_parallax_fwd_kernel(
 
     # Phase 0: left-border blocks (SWA only). Window mask only.
     for col_block_id in range(FIRST_COL_BLOCK, LEFT_BORDER_END):
-        col_indices = col_block_id * BS + tl.arange(0, BS)
-        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+        col_indices = col_block_id.to(tl.int64) * BS + tl.arange(0, BS)
+        m_kv = (col_indices[:, None] < T) & m_k[None, :]
+        p_k = k + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+        p_v = v + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+        b_k = tl.load(p_k, mask=m_kv, other=0.0)
+        b_v = tl.load(p_v, mask=m_kv, other=0.0)
         mask = (
             (col_indices[None, :] >= row_indices[:, None] - WINDOW_SIZE_LEFT + 1)
             & row_mask
@@ -256,13 +171,15 @@ def parallel_parallax_fwd_kernel(
         barv_acc = tl.dot(w.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=barv_acc)
         Rv_acc = tl.dot(wr.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=Rv_acc)
         m_acc = m_new
-        p_k = tl.advance(p_k, (BS, 0))
-        p_v = tl.advance(p_v, (BS, 0))
 
     # Phase A: safe blocks (no mask).
     for _safe in range(SAFE_MIDDLE_START, NUM_SAFE_BLOCKS):
-        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+        o_kv = _safe.to(tl.int64) * BS + tl.arange(0, BS)
+        m_kv = (o_kv[:, None] < T) & m_k[None, :]
+        p_k = k + (bos * H + i_h) * K + o_kv[:, None] * (H * K) + o_k[None, :]
+        p_v = v + (bos * H + i_h) * K + o_kv[:, None] * (H * K) + o_k[None, :]
+        b_k = tl.load(p_k, mask=m_kv, other=0.0)
+        b_v = tl.load(p_v, mask=m_kv, other=0.0)
         qk = tl.dot(b_q, tl.trans(b_k), out_dtype=tl.float32) * scale_log2
         m_new = tl.maximum(m_acc, tl.max(qk, axis=1, keep_dims=True))
         safe_m = tl.where(m_new == -float("inf"), 0.0, m_new)
@@ -277,14 +194,15 @@ def parallel_parallax_fwd_kernel(
         barv_acc = tl.dot(w.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=barv_acc)
         Rv_acc = tl.dot(wr.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=Rv_acc)
         m_acc = m_new
-        p_k = tl.advance(p_k, (BS, 0))
-        p_v = tl.advance(p_v, (BS, 0))
 
     # Phase B: right-border blocks (causal + boundary + window mask).
     for col_block_id in range(RIGHT_BORDER_START, NUM_TOTAL_BLOCKS):
-        col_indices = col_block_id * BS + tl.arange(0, BS)
-        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+        col_indices = col_block_id.to(tl.int64) * BS + tl.arange(0, BS)
+        m_kv = (col_indices[:, None] < T) & m_k[None, :]
+        p_k = k + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+        p_v = v + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+        b_k = tl.load(p_k, mask=m_kv, other=0.0)
+        b_v = tl.load(p_v, mask=m_kv, other=0.0)
         if WINDOW_SIZE_LEFT >= 0:
             mask = (
                 (row_indices[:, None] >= col_indices[None, :])
@@ -313,19 +231,17 @@ def parallel_parallax_fwd_kernel(
         barv_acc = tl.dot(w.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=barv_acc)
         Rv_acc = tl.dot(wr.to(b_v.dtype), b_v, out_dtype=tl.float32, acc=Rv_acc)
         m_acc = m_new
-        p_k = tl.advance(p_k, (BS, 0))
-        p_v = tl.advance(p_v, (BS, 0))
 
     inv_d1 = tl.where(row_mask, 1.0 / d1_acc, 0.0)
     b_barv = barv_acc * inv_d1
     b_bart = d2_acc * inv_d1
     b_o = b_barv + b_bart * b_barv - Rv_acc * inv_d1
 
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_barv, b_barv.to(p_barv.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_d1, d1_acc, boundary_check=(0, 1))
-    tl.store(p_bart, b_bart, boundary_check=(0, 1))
-    tl.store(p_m, m_acc, boundary_check=(0, 1))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_qk)
+    tl.store(p_barv, b_barv.to(p_barv.dtype.element_ty), mask=m_qk)
+    tl.store(p_d1, d1_acc, mask=row_mask)
+    tl.store(p_bart, b_bart, mask=row_mask)
+    tl.store(p_m, m_acc, mask=row_mask)
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -346,32 +262,36 @@ def parallel_parallax_bwd_kernel_preprocess(
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
         bos = (i_b * T).to(tl.int64)
 
     row_offset = i_t * BT
-    p_grad_o = tl.make_block_ptr(grad_o + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_o = tl.make_block_ptr(o + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_barv = tl.make_block_ptr(barv + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_t = tl.make_block_ptr(delta_t + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
-    p_b = tl.make_block_ptr(delta_b + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
+    o_t = row_offset + tl.arange(0, BT)
+    o_k = tl.arange(0, BK)
+    m_tk = (o_t[:, None] < T) & (o_k[None, :] < K)
+    m_t = o_t[:, None] < T
+    p_grad_o = grad_o + (bos * HQ + i_hq) * K + o_t[:, None] * (HQ * K) + o_k[None, :]
+    p_o = o + (bos * HQ + i_hq) * K + o_t[:, None] * (HQ * K) + o_k[None, :]
+    p_barv = barv + (bos * HQ + i_hq) * K + o_t[:, None] * (HQ * K) + o_k[None, :]
+    p_t = delta_t + bos * HQ + i_hq + o_t[:, None] * HQ
+    p_b = delta_b + bos * HQ + i_hq + o_t[:, None] * HQ
 
-    b_grad_o = tl.load(p_grad_o, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
-    b_o = tl.load(p_o, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
-    b_barv = tl.load(p_barv, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    b_grad_o = tl.load(p_grad_o, mask=m_tk, other=0.0).to(tl.float32)
+    b_o = tl.load(p_o, mask=m_tk, other=0.0).to(tl.float32)
+    b_barv = tl.load(p_barv, mask=m_tk, other=0.0).to(tl.float32)
 
     b_t = tl.sum(b_grad_o * b_o, axis=1, keep_dims=True)
     b_b = tl.sum(b_grad_o * b_barv, axis=1, keep_dims=True)
 
-    tl.store(p_t, b_t, boundary_check=(0, 1))
-    tl.store(p_b, b_b, boundary_check=(0, 1))
+    tl.store(p_t, b_t, mask=m_t)
+    tl.store(p_b, b_b, mask=m_t)
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -404,12 +324,12 @@ def parallel_parallax_bwd_kernel_dqr(
     BS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
@@ -436,27 +356,28 @@ def parallel_parallax_bwd_kernel_dqr(
     SAFE_MIDDLE_START = tl.maximum(FIRST_COL_BLOCK, SAFE_LEFT_START)
     RIGHT_BORDER_START = tl.maximum(FIRST_COL_BLOCK, NUM_SAFE_BLOCKS)
 
-    p_q = tl.make_block_ptr(q + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_r = tl.make_block_ptr(r + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (FIRST_COL_BLOCK * BS, 0), (BS, BK), (1, 0))
-    p_v = tl.make_block_ptr(v + (bos * H + i_h) * K, (T, K), (H * K, 1), (FIRST_COL_BLOCK * BS, 0), (BS, BK), (1, 0))
-    p_d1 = tl.make_block_ptr(d1 + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
-    p_bart = tl.make_block_ptr(bart + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
-    p_m = tl.make_block_ptr(m + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
-    p_t = tl.make_block_ptr(delta_t + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
-    p_b = tl.make_block_ptr(delta_b + bos * HQ + i_hq, (T, 1), (HQ, 1), (row_offset, 0), (BT, 1), (1, 0))
-    p_grad_o = tl.make_block_ptr(grad_o + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_grad_q = tl.make_block_ptr(grad_q + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
-    p_grad_r = tl.make_block_ptr(grad_r + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (row_offset, 0), (BT, BK), (1, 0))
+    o_k = tl.arange(0, BK)
+    m_k = o_k < K
+    m_qk = row_mask & m_k[None, :]
+    p_q = q + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+    p_r = r + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+    p_d1 = d1 + bos * HQ + i_hq + row_indices[:, None] * HQ
+    p_bart = bart + bos * HQ + i_hq + row_indices[:, None] * HQ
+    p_m = m + bos * HQ + i_hq + row_indices[:, None] * HQ
+    p_t = delta_t + bos * HQ + i_hq + row_indices[:, None] * HQ
+    p_b = delta_b + bos * HQ + i_hq + row_indices[:, None] * HQ
+    p_grad_o = grad_o + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+    p_grad_q = grad_q + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+    p_grad_r = grad_r + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
 
-    b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
-    b_r = tl.load(p_r, boundary_check=(0, 1), padding_option="zero")
-    b_d1 = tl.load(p_d1, boundary_check=(0, 1), padding_option="zero")
-    b_bart = tl.load(p_bart, boundary_check=(0, 1), padding_option="zero")
-    b_m = tl.load(p_m, boundary_check=(0, 1), padding_option="zero")
-    b_t = tl.load(p_t, boundary_check=(0, 1), padding_option="zero")
-    b_b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero")
-    grad_o_tile = tl.load(p_grad_o, boundary_check=(0, 1), padding_option="zero")
+    b_q = tl.load(p_q, mask=m_qk, other=0.0)
+    b_r = tl.load(p_r, mask=m_qk, other=0.0)
+    b_d1 = tl.load(p_d1, mask=row_mask, other=0.0)
+    b_bart = tl.load(p_bart, mask=row_mask, other=0.0)
+    b_m = tl.load(p_m, mask=row_mask, other=0.0)
+    b_t = tl.load(p_t, mask=row_mask, other=0.0)
+    b_b = tl.load(p_b, mask=row_mask, other=0.0)
+    grad_o_tile = tl.load(p_grad_o, mask=m_qk, other=0.0)
     grad_q_acc = tl.zeros((BT, BK), dtype=tl.float32)
     grad_r_acc = tl.zeros((BT, BK), dtype=tl.float32)
     scale_log2 = scale * RCP_LN2
@@ -465,9 +386,12 @@ def parallel_parallax_bwd_kernel_dqr(
 
     # Phase 0: left-border blocks (SWA only).
     for col_block_id in range(FIRST_COL_BLOCK, LEFT_BORDER_END):
-        col_indices = col_block_id * BS + tl.arange(0, BS)
-        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+        col_indices = col_block_id.to(tl.int64) * BS + tl.arange(0, BS)
+        m_kv = (col_indices[:, None] < T) & m_k[None, :]
+        p_k = k + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+        p_v = v + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+        b_k = tl.load(p_k, mask=m_kv, other=0.0)
+        b_v = tl.load(p_v, mask=m_kv, other=0.0)
         mask = (
             (col_indices[None, :] >= row_indices[:, None] - WINDOW_SIZE_LEFT + 1)
             & row_mask
@@ -485,13 +409,15 @@ def parallel_parallax_bwd_kernel_dqr(
         gu = -p * delta
         grad_q_acc = tl.dot(gl.to(b_k.dtype), b_k, out_dtype=tl.float32, acc=grad_q_acc)
         grad_r_acc = tl.dot(gu.to(b_k.dtype), b_k, out_dtype=tl.float32, acc=grad_r_acc)
-        p_k = tl.advance(p_k, (BS, 0))
-        p_v = tl.advance(p_v, (BS, 0))
 
     # Phase A: safe blocks (no mask).
     for _ in range(SAFE_MIDDLE_START, NUM_SAFE_BLOCKS):
-        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+        o_kv = _.to(tl.int64) * BS + tl.arange(0, BS)
+        m_kv = (o_kv[:, None] < T) & m_k[None, :]
+        p_k = k + (bos * H + i_h) * K + o_kv[:, None] * (H * K) + o_k[None, :]
+        p_v = v + (bos * H + i_h) * K + o_kv[:, None] * (H * K) + o_k[None, :]
+        b_k = tl.load(p_k, mask=m_kv, other=0.0)
+        b_v = tl.load(p_v, mask=m_kv, other=0.0)
         qk = tl.dot(b_q, tl.trans(b_k), out_dtype=tl.float32) * scale_log2
         w = exp2(qk - b_m)
         a = tl.dot(grad_o_tile, tl.trans(b_v), out_dtype=tl.float32)
@@ -503,14 +429,15 @@ def parallel_parallax_bwd_kernel_dqr(
         gu = -p * delta
         grad_q_acc = tl.dot(gl.to(b_k.dtype), b_k, out_dtype=tl.float32, acc=grad_q_acc)
         grad_r_acc = tl.dot(gu.to(b_k.dtype), b_k, out_dtype=tl.float32, acc=grad_r_acc)
-        p_k = tl.advance(p_k, (BS, 0))
-        p_v = tl.advance(p_v, (BS, 0))
 
     # Phase B: right-border blocks (causal + boundary + window mask).
     for col_block_id in range(RIGHT_BORDER_START, NUM_TOTAL_BLOCKS):
-        col_indices = col_block_id * BS + tl.arange(0, BS)
-        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+        col_indices = col_block_id.to(tl.int64) * BS + tl.arange(0, BS)
+        m_kv = (col_indices[:, None] < T) & m_k[None, :]
+        p_k = k + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+        p_v = v + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+        b_k = tl.load(p_k, mask=m_kv, other=0.0)
+        b_v = tl.load(p_v, mask=m_kv, other=0.0)
         if WINDOW_SIZE_LEFT >= 0:
             mask = (
                 (row_indices[:, None] >= col_indices[None, :])
@@ -536,13 +463,11 @@ def parallel_parallax_bwd_kernel_dqr(
         gu = -p * delta
         grad_q_acc = tl.dot(gl.to(b_k.dtype), b_k, out_dtype=tl.float32, acc=grad_q_acc)
         grad_r_acc = tl.dot(gu.to(b_k.dtype), b_k, out_dtype=tl.float32, acc=grad_r_acc)
-        p_k = tl.advance(p_k, (BS, 0))
-        p_v = tl.advance(p_v, (BS, 0))
 
     grad_q_acc = scale * grad_q_acc
 
-    tl.store(p_grad_q, grad_q_acc.to(p_grad_q.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_grad_r, grad_r_acc.to(p_grad_r.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_grad_q, grad_q_acc.to(p_grad_q.dtype.element_ty), mask=m_qk)
+    tl.store(p_grad_r, grad_r_acc.to(p_grad_r.dtype.element_ty), mask=m_qk)
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -575,12 +500,12 @@ def parallel_parallax_bwd_kernel_dkv(
     BS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
@@ -591,7 +516,6 @@ def parallel_parallax_bwd_kernel_dkv(
     col_indices = col_offset + tl.arange(0, BS)
 
     start_row_block = col_offset // BT
-    start_row_offset = start_row_block * BT
 
     num_row_blocks_qbound = tl.cdiv(T, BT)
     if WINDOW_SIZE_LEFT >= 0:
@@ -602,21 +526,16 @@ def parallel_parallax_bwd_kernel_dkv(
         num_row_blocks = num_row_blocks_qbound
         WINDOW_SAFE_END = num_row_blocks
 
-    p_q = tl.make_block_ptr(q + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (start_row_offset, 0), (BT, BK), (1, 0))
-    p_r = tl.make_block_ptr(r + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (start_row_offset, 0), (BT, BK), (1, 0))
-    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (col_offset, 0), (BS, BK), (1, 0))
-    p_v = tl.make_block_ptr(v + (bos * H + i_h) * K, (T, K), (H * K, 1), (col_offset, 0), (BS, BK), (1, 0))
-    p_d1 = tl.make_block_ptr(d1 + bos * HQ + i_hq, (T, 1), (HQ, 1), (start_row_offset, 0), (BT, 1), (1, 0))
-    p_bart = tl.make_block_ptr(bart + bos * HQ + i_hq, (T, 1), (HQ, 1), (start_row_offset, 0), (BT, 1), (1, 0))
-    p_m = tl.make_block_ptr(m + bos * HQ + i_hq, (T, 1), (HQ, 1), (start_row_offset, 0), (BT, 1), (1, 0))
-    p_t = tl.make_block_ptr(delta_t + bos * HQ + i_hq, (T, 1), (HQ, 1), (start_row_offset, 0), (BT, 1), (1, 0))
-    p_b = tl.make_block_ptr(delta_b + bos * HQ + i_hq, (T, 1), (HQ, 1), (start_row_offset, 0), (BT, 1), (1, 0))
-    p_grad_o = tl.make_block_ptr(grad_o + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (start_row_offset, 0), (BT, BK), (1, 0))
-    p_grad_k = tl.make_block_ptr(grad_k + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (col_offset, 0), (BS, BK), (1, 0))
-    p_grad_v = tl.make_block_ptr(grad_v + (bos * HQ + i_hq) * K, (T, K), (HQ * K, 1), (col_offset, 0), (BS, BK), (1, 0))
+    o_k = tl.arange(0, BK)
+    m_k = o_k < K
+    m_ck = (col_indices[:, None] < T) & m_k[None, :]
+    p_k = k + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+    p_v = v + (bos * H + i_h) * K + col_indices[:, None] * (H * K) + o_k[None, :]
+    p_grad_k = grad_k + (bos * HQ + i_hq) * K + col_indices[:, None] * (HQ * K) + o_k[None, :]
+    p_grad_v = grad_v + (bos * HQ + i_hq) * K + col_indices[:, None] * (HQ * K) + o_k[None, :]
 
-    b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
-    b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+    b_k = tl.load(p_k, mask=m_ck, other=0.0)
+    b_v = tl.load(p_v, mask=m_ck, other=0.0)
     grad_k_acc = tl.zeros((BS, BK), dtype=tl.float32)
     grad_v_acc = tl.zeros((BS, BK), dtype=tl.float32)
     scale_log2 = scale * RCP_LN2
@@ -628,17 +547,26 @@ def parallel_parallax_bwd_kernel_dkv(
     # Phase A: causal-border row blocks.
     causal_end = tl.minimum(first_safe_row_block, num_row_blocks)
     for row_block_id in range(start_row_block, causal_end):
-        row_offset = row_block_id * BT
+        row_offset = row_block_id.to(tl.int64) * BT
         row_indices = row_offset + tl.arange(0, BT)
         row_mask = row_indices[:, None] < T
-        b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
-        b_r = tl.load(p_r, boundary_check=(0, 1), padding_option="zero")
-        b_d1 = tl.load(p_d1, boundary_check=(0, 1), padding_option="zero")
-        b_bart = tl.load(p_bart, boundary_check=(0, 1), padding_option="zero")
-        b_m = tl.load(p_m, boundary_check=(0, 1), padding_option="zero")
-        b_t = tl.load(p_t, boundary_check=(0, 1), padding_option="zero")
-        b_b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero")
-        grad_o_tile = tl.load(p_grad_o, boundary_check=(0, 1), padding_option="zero")
+        m_qk = row_mask & m_k[None, :]
+        p_q = q + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+        p_r = r + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+        p_d1 = d1 + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_bart = bart + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_m = m + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_t = delta_t + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_b = delta_b + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_grad_o = grad_o + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+        b_q = tl.load(p_q, mask=m_qk, other=0.0)
+        b_r = tl.load(p_r, mask=m_qk, other=0.0)
+        b_d1 = tl.load(p_d1, mask=row_mask, other=0.0)
+        b_bart = tl.load(p_bart, mask=row_mask, other=0.0)
+        b_m = tl.load(p_m, mask=row_mask, other=0.0)
+        b_t = tl.load(p_t, mask=row_mask, other=0.0)
+        b_b = tl.load(p_b, mask=row_mask, other=0.0)
+        grad_o_tile = tl.load(p_grad_o, mask=m_qk, other=0.0)
 
         qk = tl.dot(b_q, tl.trans(b_k), out_dtype=tl.float32) * scale_log2
         rk = tl.dot(b_r, tl.trans(b_k), out_dtype=tl.float32)
@@ -669,29 +597,29 @@ def parallel_parallax_bwd_kernel_dkv(
         weights = p * (1 + bart_minus_rk)
         grad_v_acc = tl.dot(tl.trans(weights).to(grad_o_tile.dtype), grad_o_tile, out_dtype=tl.float32, acc=grad_v_acc)
 
-        p_q = tl.advance(p_q, (BT, 0))
-        p_r = tl.advance(p_r, (BT, 0))
-        p_d1 = tl.advance(p_d1, (BT, 0))
-        p_bart = tl.advance(p_bart, (BT, 0))
-        p_m = tl.advance(p_m, (BT, 0))
-        p_t = tl.advance(p_t, (BT, 0))
-        p_b = tl.advance(p_b, (BT, 0))
-        p_grad_o = tl.advance(p_grad_o, (BT, 0))
-
     # Phase B: safe row blocks (no causal/col/window mask).
     safe_b_start = tl.maximum(first_safe_row_block, start_row_block)
     for row_block_id in range(safe_b_start, SAFE_MIDDLE_END):
-        row_offset = row_block_id * BT
+        row_offset = row_block_id.to(tl.int64) * BT
         row_indices = row_offset + tl.arange(0, BT)
         row_mask = row_indices[:, None] < T
-        b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
-        b_r = tl.load(p_r, boundary_check=(0, 1), padding_option="zero")
-        b_d1 = tl.load(p_d1, boundary_check=(0, 1), padding_option="zero")
-        b_bart = tl.load(p_bart, boundary_check=(0, 1), padding_option="zero")
-        b_m = tl.load(p_m, boundary_check=(0, 1), padding_option="zero")
-        b_t = tl.load(p_t, boundary_check=(0, 1), padding_option="zero")
-        b_b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero")
-        grad_o_tile = tl.load(p_grad_o, boundary_check=(0, 1), padding_option="zero")
+        m_qk = row_mask & m_k[None, :]
+        p_q = q + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+        p_r = r + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+        p_d1 = d1 + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_bart = bart + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_m = m + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_t = delta_t + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_b = delta_b + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_grad_o = grad_o + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+        b_q = tl.load(p_q, mask=m_qk, other=0.0)
+        b_r = tl.load(p_r, mask=m_qk, other=0.0)
+        b_d1 = tl.load(p_d1, mask=row_mask, other=0.0)
+        b_bart = tl.load(p_bart, mask=row_mask, other=0.0)
+        b_m = tl.load(p_m, mask=row_mask, other=0.0)
+        b_t = tl.load(p_t, mask=row_mask, other=0.0)
+        b_b = tl.load(p_b, mask=row_mask, other=0.0)
+        grad_o_tile = tl.load(p_grad_o, mask=m_qk, other=0.0)
 
         qk = tl.dot(b_q, tl.trans(b_k), out_dtype=tl.float32) * scale_log2
         rk = tl.dot(b_r, tl.trans(b_k), out_dtype=tl.float32)
@@ -708,29 +636,29 @@ def parallel_parallax_bwd_kernel_dkv(
         weights = p * (1 + bart_minus_rk)
         grad_v_acc = tl.dot(tl.trans(weights).to(grad_o_tile.dtype), grad_o_tile, out_dtype=tl.float32, acc=grad_v_acc)
 
-        p_q = tl.advance(p_q, (BT, 0))
-        p_r = tl.advance(p_r, (BT, 0))
-        p_d1 = tl.advance(p_d1, (BT, 0))
-        p_bart = tl.advance(p_bart, (BT, 0))
-        p_m = tl.advance(p_m, (BT, 0))
-        p_t = tl.advance(p_t, (BT, 0))
-        p_b = tl.advance(p_b, (BT, 0))
-        p_grad_o = tl.advance(p_grad_o, (BT, 0))
-
     # Phase C: window-border row blocks (SWA only).
     window_border_start = tl.maximum(WINDOW_BORDER_START, start_row_block)
     for row_block_id in range(window_border_start, num_row_blocks):
-        row_offset = row_block_id * BT
+        row_offset = row_block_id.to(tl.int64) * BT
         row_indices = row_offset + tl.arange(0, BT)
         row_mask = row_indices[:, None] < T
-        b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
-        b_r = tl.load(p_r, boundary_check=(0, 1), padding_option="zero")
-        b_d1 = tl.load(p_d1, boundary_check=(0, 1), padding_option="zero")
-        b_bart = tl.load(p_bart, boundary_check=(0, 1), padding_option="zero")
-        b_m = tl.load(p_m, boundary_check=(0, 1), padding_option="zero")
-        b_t = tl.load(p_t, boundary_check=(0, 1), padding_option="zero")
-        b_b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero")
-        grad_o_tile = tl.load(p_grad_o, boundary_check=(0, 1), padding_option="zero")
+        m_qk = row_mask & m_k[None, :]
+        p_q = q + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+        p_r = r + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+        p_d1 = d1 + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_bart = bart + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_m = m + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_t = delta_t + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_b = delta_b + bos * HQ + i_hq + row_indices[:, None] * HQ
+        p_grad_o = grad_o + (bos * HQ + i_hq) * K + row_indices[:, None] * (HQ * K) + o_k[None, :]
+        b_q = tl.load(p_q, mask=m_qk, other=0.0)
+        b_r = tl.load(p_r, mask=m_qk, other=0.0)
+        b_d1 = tl.load(p_d1, mask=row_mask, other=0.0)
+        b_bart = tl.load(p_bart, mask=row_mask, other=0.0)
+        b_m = tl.load(p_m, mask=row_mask, other=0.0)
+        b_t = tl.load(p_t, mask=row_mask, other=0.0)
+        b_b = tl.load(p_b, mask=row_mask, other=0.0)
+        grad_o_tile = tl.load(p_grad_o, mask=m_qk, other=0.0)
 
         qk = tl.dot(b_q, tl.trans(b_k), out_dtype=tl.float32) * scale_log2
         rk = tl.dot(b_r, tl.trans(b_k), out_dtype=tl.float32)
@@ -753,17 +681,8 @@ def parallel_parallax_bwd_kernel_dkv(
         weights = p * (1 + bart_minus_rk)
         grad_v_acc = tl.dot(tl.trans(weights).to(grad_o_tile.dtype), grad_o_tile, out_dtype=tl.float32, acc=grad_v_acc)
 
-        p_q = tl.advance(p_q, (BT, 0))
-        p_r = tl.advance(p_r, (BT, 0))
-        p_d1 = tl.advance(p_d1, (BT, 0))
-        p_bart = tl.advance(p_bart, (BT, 0))
-        p_m = tl.advance(p_m, (BT, 0))
-        p_t = tl.advance(p_t, (BT, 0))
-        p_b = tl.advance(p_b, (BT, 0))
-        p_grad_o = tl.advance(p_grad_o, (BT, 0))
-
-    tl.store(p_grad_k, grad_k_acc.to(p_grad_k.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_grad_v, grad_v_acc.to(p_grad_v.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_grad_k, grad_k_acc.to(p_grad_k.dtype.element_ty), mask=m_ck)
+    tl.store(p_grad_v, grad_v_acc.to(p_grad_v.dtype.element_ty), mask=m_ck)
 
 def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None, window_size_left=-1):
     """Parallax forward (Triton). `(B, T, HQ, D)` / packed `(1, T_total, HQ, D)` inputs.
@@ -793,22 +712,7 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
     )
     return o, barv, d1, bart, m
 
-def parallel_parallax_bwd(
-    q,
-    r,
-    k,
-    v,
-    o,
-    barv,
-    d1,
-    bart,
-    m,
-    grad_o,
-    scale,
-    cu_seqlens=None,
-    chunk_indices=None,
-    window_size_left=-1,
-):
+def parallel_parallax_bwd(q, r, k, v, o, barv, d1, bart, m, grad_o, scale, cu_seqlens=None, chunk_indices=None, window_size_left=-1):
     """Parallax backward (Triton). Returns grads matching `q, r, k, v`."""
     B, T, HQ, K = q.shape
     H = k.shape[2]
@@ -847,20 +751,19 @@ def parallel_parallax_bwd(
         WINDOW_SIZE_LEFT=window_size_left, BT=BT, BS=BT,
         num_warps=8, num_stages=2,
     )
-
     if G == 1:
         grad_k = grad_k_buf
         grad_v = grad_v_buf
     else:
-        grad_k = grad_k_buf.reshape(B, T, H, G, K).sum(dim=3)
-        grad_v = grad_v_buf.reshape(B, T, H, G, K).sum(dim=3)
+        grad_k = reduce(grad_k_buf, 'b t (h g) k -> b t h k', g=G, reduction='sum')
+        grad_v = reduce(grad_v_buf, 'b t (h g) k -> b t h k', g=G, reduction='sum')
     return grad_q, grad_r, grad_k, grad_v
 
 class ParallaxFunction(torch.autograd.Function):
 
     @staticmethod
-    @contiguous
-    @autocast_custom_fwd
+    @input_guard
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, q, r, k, v, scale, window_size_left, cu_seqlens):
         chunk_indices = prepare_chunk_indices(cu_seqlens, _block_size(q.shape[-1], q.device.index)) \
             if cu_seqlens is not None else None
@@ -873,8 +776,8 @@ class ParallaxFunction(torch.autograd.Function):
         return o
 
     @staticmethod
-    @contiguous
-    @autocast_custom_bwd
+    @input_guard
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, do):
         q, r, k, v, o, barv, d1, bart, m = ctx.saved_tensors
         gq, gr, gk, gv = parallel_parallax_bwd(
