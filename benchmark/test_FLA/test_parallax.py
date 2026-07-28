@@ -52,7 +52,9 @@ class PhaseBenchmarkResult:
 
     @property
     def speedup(self) -> float:
-        return self.flaggems_ms / self.fla_ms
+        # FLA is the baseline. A value greater than 1 means that
+        # FlagGems has lower latency and is therefore faster.
+        return self.fla_ms / self.flaggems_ms
 
 
 DEFAULT_CASES = (
@@ -248,17 +250,17 @@ def _measurement_order(
 
     if cycle % 2 == 0:
         return (
-            flaggems_fn,
-            fla_fn,
             fla_fn,
             flaggems_fn,
+            flaggems_fn,
+            fla_fn,
         )
 
     return (
-        fla_fn,
-        flaggems_fn,
         flaggems_fn,
         fla_fn,
+        fla_fn,
+        flaggems_fn,
     )
 
 
@@ -464,8 +466,8 @@ def _selected_dtypes() -> list[torch.dtype]:
 
 def _print_header(
     title: str,
-    flaggems_column: str,
     fla_column: str,
+    flaggems_column: str,
 ) -> None:
     print()
     print("=" * TABLE_WIDTH)
@@ -478,8 +480,8 @@ def _print_header(
         f"{'HQ':>4} "
         f"{'D':>4} "
         f"{'dtype':>9} "
-        f"{flaggems_column:>23} "
         f"{fla_column:>18} "
+        f"{flaggems_column:>23} "
         f"{'speedup':>11} "
 
     )
@@ -503,8 +505,8 @@ def _print_result(
         f"{case.HQ:>4} "
         f"{case.D:>4} "
         f"{dtype_name:>9} "
-        f"{result.flaggems_ms:>23.3f} "
         f"{result.fla_ms:>18.3f} "
+        f"{result.flaggems_ms:>23.3f} "
         f"{result.speedup:>10.3f}x "
 
 
@@ -514,13 +516,13 @@ def _print_result(
 def _run_phase_table(
     phase: str,
     title: str,
-    flaggems_column: str,
     fla_column: str,
+    flaggems_column: str,
 ) -> None:
     _print_header(
         title=title,
-        flaggems_column=flaggems_column,
         fla_column=fla_column,
+        flaggems_column=flaggems_column,
     )
 
     for dtype in _selected_dtypes():
@@ -550,7 +552,7 @@ def test_perf_parallel_parallax() -> None:
     print(
         "\n"
         "[parallel_parallax: "
-        "FlagGems baseline vs FLA]"
+        "FLA baseline vs FlagGems]"
     )
 
     print(
@@ -566,9 +568,9 @@ def test_perf_parallel_parallax() -> None:
         f"{BALANCED_MEASUREMENT_CYCLES * 2}"
     )
     print(
-        "baseline = FlagGems; "
-        "speedup = FlagGems latency / FLA latency; "
-        ">1 means FLA is faster"
+        "baseline = FLA; "
+        "speedup = FLA latency / FlagGems latency; "
+        ">1 means FlagGems is faster"
     )
     print(
         "MAD% = relative median absolute deviation; "
@@ -579,13 +581,13 @@ def test_perf_parallel_parallax() -> None:
     _run_phase_table(
         phase="fwd",
         title="[Forward]",
-        flaggems_column="FlagGems-fwd(ms)",
         fla_column="FLA-fwd(ms)",
+        flaggems_column="FlagGems-fwd(ms)",
     )
 
     _run_phase_table(
         phase="fwd_bwd",
         title="[Forward + Backward]",
-        flaggems_column="FlagGems-fwdbwd(ms)",
         fla_column="FLA-fwdbwd(ms)",
+        flaggems_column="FlagGems-fwdbwd(ms)",
     )
