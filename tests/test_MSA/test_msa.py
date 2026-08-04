@@ -598,27 +598,33 @@ def _run_decode(case: tuple, mode: str) -> None:
 
 
 PREFILL_CASES = [
+    # Boundary and padding: valid_blocks=2, topk=4.
     ((129,), (0,), 1, 16, 4, 1, 2),
-    ((257, 513, 129), (0, 64, 128), 2, 8, 8, 1, 2),
-    ((1025, 257, 513, 65), (256, 64, 128, 0), 4, 4, 16, 2, 3),
+    # Selection: 1024 tokens -> 8 blocks, topk=4.
+    ((1024,), (0,), 2, 8, 4, 1, 2),
+    # Ragged/prefix selection: late queries see 32/16/9 blocks, topk=8.
+    ((4096, 2048, 1025), (0, 256, 128), 4, 4, 8, 1, 2),
 ]
 
 DECODE_CASES = [
-    ((129,), 1, 16, 4, 1, 2, 1),
-    ((257, 513, 129), 2, 8, 8, 1, 2, 4),
-    ((1025, 257, 513, 65, 129), 4, 4, 16, 2, 3, 8),
+    # Boundary and selection: 512 tokens -> 4 blocks, topk=3.
+    ((512,), 1, 16, 3, 1, 2, 1),
+    # Ragged selection: late queries see 16/8/5 blocks, topk=4.
+    ((2048, 1024, 513), 2, 8, 4, 1, 2, 4),
+    # Long GQA case with both selection and a short padding request.
+    ((8192, 2048, 1025, 129), 4, 4, 8, 2, 3, 8),
 ]
 
 
 @pytest.mark.parametrize(
-    "case", PREFILL_CASES, ids=("short", "ragged_prefix", "padded_batch")
+    "case", PREFILL_CASES, ids=("boundary", "selection", "long_ragged")
 )
 def test_prefill_bf16(case: tuple) -> None:
     _run_prefill(case, "bf16")
 
 
 @pytest.mark.parametrize(
-    "case", DECODE_CASES, ids=("short", "spec_decode", "padded_batch")
+    "case", DECODE_CASES, ids=("boundary", "selection", "long_gqa")
 )
 def test_decode_bf16(case: tuple) -> None:
     _run_decode(case, "bf16")
@@ -629,7 +635,7 @@ def test_decode_bf16(case: tuple) -> None:
     reason="FP8 tests require an NVIDIA GPU with FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
-@pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("short", "ragged_prefix"))
+@pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("boundary", "selection"))
 def test_prefill_fp8(mode: str, case: tuple) -> None:
     _run_prefill(case, mode)
 
@@ -639,6 +645,6 @@ def test_prefill_fp8(mode: str, case: tuple) -> None:
     reason="FP8 tests require an NVIDIA GPU with FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
-@pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("short", "spec_decode"))
+@pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("boundary", "selection"))
 def test_decode_fp8(mode: str, case: tuple) -> None:
     _run_decode(case, mode)

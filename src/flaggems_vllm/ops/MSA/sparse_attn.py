@@ -99,9 +99,9 @@ def _gqa_sparse_fwd_kernel(
     pid_kh = tl.program_id(1)
     pid_b = tl.program_id(2)
     pid_h = pid_kh * gqa_group_size
-    q_start = tl.load(cu_seqlens_q + pid_b)
-    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
-    q_block_start = tl.load(cu_seqblocks_q + pid_b)
+    q_start = tl.load(cu_seqlens_q + pid_b)    
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start 
+    q_block_start = tl.load(cu_seqblocks_q + pid_b)       
     q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
     seq_len = tl.load(seq_lens + pid_b)
     prefix_len = tl.load(prefix_lens + pid_b)
@@ -110,8 +110,6 @@ def _gqa_sparse_fwd_kernel(
     real_q_loop = min(num_q_loop, q_block_len - pid_q * num_q_loop)
     bt_row = block_table_ptr + pid_b * stride_bt_b
     off_n = tl.arange(0, BLOCK_SIZE_K)
-    off_d = tl.arange(0, BLOCK_SIZE_D)
-    d_mask = off_d < head_dim
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
@@ -135,7 +133,8 @@ def _gqa_sparse_fwd_kernel(
             - tl.arange(0, BLOCK_SIZE_K)[None, :]
         )
         m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
-        lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
+        # 统一：所有路径都在线性空间累加分母
+        l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
         acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
         for _ in range(real_topk):
@@ -143,17 +142,23 @@ def _gqa_sparse_fwd_kernel(
             t_ptr_j = t_ptr_j + stride_tk
             c = blk * BLOCK_SIZE_K
             page = tl.load(bt_row + blk).to(tl.int64)
+
             pos = c + off_n
             pos_mask = pos < seq_len
-            k = tl.load(
-                kv_cache_ptr
-                + page * stride_kv_blk
-                + pid_kh * stride_kv_h
-                + off_n[None, :] * stride_kv_pos
-                + off_d[:, None] * stride_kv_d,
-                mask=d_mask[:, None] & pos_mask[None, :],
-                other=0.0,
+            
+            # --- 构建 K 的 Block Pointer ---
+            k_base_ptr = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
+            
+            k_ptrs = tl.make_block_ptr(
+                base=k_base_ptr,
+                shape=(head_dim, BLOCK_SIZE_K),          
+                strides=(stride_kv_d, stride_kv_pos), 
+                offsets=(0, 0),
+                block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_K),
+                order=(0, 1)                          
             )
+            k = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero")
+
             if USE_FP8:
                 k = k.to(q.dtype)
                 if KV_SCALE_MODE == 1:
@@ -167,25 +172,42 @@ def _gqa_sparse_fwd_kernel(
                         other=1.0,
                     )
                     k = (k * k_scale[None, :]).to(q.dtype)
+            
+            is_full_causal = (c + BLOCK_SIZE_K) <= q_abs
+            is_full_seq    = (c + BLOCK_SIZE_K) <= seq_len
+
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-            # causal: q_abs_pos - k_off >= block_start (c)
-            qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
+            if not is_full_causal:
+                qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
+
             qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
             qk += tl.dot(q, k) * sm_scale_log2e
-            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+
+            if not is_full_seq:
+                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+            
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
             p = tl.exp2(qk - m_ij[:, None])
             l_ij = tl.sum(p, axis=1)
-            acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-            v = tl.load(
-                kv_cache_ptr
-                + page * stride_kv_blk
-                + pid_kh * stride_kv_h
-                + off_n[:, None] * stride_kv_pos
-                + (head_dim + off_d[None, :]) * stride_kv_d,
-                mask=pos_mask[:, None] & d_mask[None, :],
-                other=0.0,
+            
+            # 统一：线性空间累加
+            alpha = tl.exp2(m_i - m_ij)
+            acc_o = acc_o * alpha[:, None]
+            l_i = l_i * alpha + l_ij
+
+            # --- 构建 V 的 Block Pointer ---
+            v_base_ptr = k_base_ptr + head_dim * stride_kv_d
+            
+            v_ptrs = tl.make_block_ptr(
+                base=v_base_ptr,
+                shape=(BLOCK_SIZE_K, head_dim),
+                strides=(stride_kv_pos, stride_kv_d),
+                offsets=(0, 0),
+                block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
+                order=(1, 0)
             )
+            v = tl.load(v_ptrs, boundary_check=(0, 1), padding_option="zero")
+
             if USE_FP8:
                 v = v.to(q.dtype)
                 if KV_SCALE_MODE == 1:
@@ -199,10 +221,12 @@ def _gqa_sparse_fwd_kernel(
                         other=1.0,
                     )
                     v = (v * v_scale[:, None]).to(q.dtype)
+            
             acc_o += tl.dot(p.to(v.dtype), v)
             m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-        acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
+        
+        # 统一：尾端归一化
+        acc_o = acc_o * tl.where(l_i > 0, 1.0 / l_i, 0.0)[:, None]
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
         o_ptrs = tl.make_block_ptr(
             base=o_ptr + q_start * stride_on + pid_h * stride_oh,
@@ -485,7 +509,7 @@ def _kv_scale_args(
     if k_scale is None or v_scale is None:
         raise ValueError("k_scale and v_scale must be both provided or both None")
     if k_scale.device != output.device or v_scale.device != output.device:
-        raise ValueError("k_scale and v_scale must be on the same device as output")
+        raise ValueError("k_scale and v_scale must be on the same dvice as output")
     if k_scale.numel() == 1 and v_scale.numel() == 1:
         return k_scale, v_scale, 0, 0, 0, 0, _KV_SCALE_SCALAR
     if k_scale.dim() == 2 and v_scale.dim() == 2:

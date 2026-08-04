@@ -246,6 +246,10 @@ def make_data(
     physical_pages = torch.randperm(total_blocks, device=device, generator=generator)
     if not randomize_pages:
         physical_pages = torch.arange(total_blocks, device=device)
+    # 添加：如果使用FP8，强制不随机化页面
+    if dtype_name == "fp8":
+        physical_pages = torch.arange(total_blocks, device=device)
+        randomize_pages = False  # 实际没有随机化    
     block_table = physical_pages.reshape(batch, blocks_per_request).to(torch.int32)
     if randomize_pages:
         kv_cache = kv_cache[physical_pages.argsort()].contiguous()
@@ -719,9 +723,9 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="bf16")
+    parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="both")
     parser.add_argument("--shape", default=None)
-    parser.add_argument("--topk", type=int, default=32)
+    parser.add_argument("--topk", type=int, default=16)
     parser.add_argument("--init-blocks", type=int, default=1)
     parser.add_argument("--local-blocks", type=int, default=2)
     parser.add_argument("--all-shapes", action="store_true")
