@@ -91,16 +91,20 @@ DEFAULT_WARMUP = 200
 DEFAULT_REP = 300
 KV_SCALE = 0.5
 
+
 PREFILL_SHAPES = [
     (1, 8192, 16, 96),
-    (2, 16384, 8, 96),
-    (4, 2048, 16, 96),
-    (4, 4096, 16, 384),
-    (8, 2048, 32, 192),
-    (2, 2048, 16, 96),
-    (4, 1024, 8, 96),
-    (8, 1024, 8, 48),
+    # (2, 16384, 8, 96),
+    # (1, 32768, 16, 96),
+    # (2, 8192, 8, 96),
+    # (4, 4096, 16, 384),
+    # (4, 2048, 16, 96),
+    # (8, 2048, 32, 192),
+    # (2, 2048, 16, 96),
+    # (4, 1024, 8, 96),
+    # (8, 1024, 8, 48),
 ]
+
 
 DECODE_SHAPES = [
     (1, 4096, 16, 96),
@@ -723,7 +727,7 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="both")
+    parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="bf16")
     parser.add_argument("--shape", default=None)
     parser.add_argument("--topk", type=int, default=16)
     parser.add_argument("--init-blocks", type=int, default=1)
