@@ -66,7 +66,6 @@ def _gqa_sparse_fwd_kernel(
     gqa_group_size,
     head_dim,
     max_topk,
-    num_q_loop,
     sm_scale,
     stride_qn,
     stride_qh,
@@ -91,6 +90,7 @@ def _gqa_sparse_fwd_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_QH: tl.constexpr,
+    TOPK_COVERS_PAGES: tl.constexpr,
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
 ):
@@ -105,114 +105,142 @@ def _gqa_sparse_fwd_kernel(
     q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
     seq_len = tl.load(seq_lens + pid_b)
     prefix_len = tl.load(prefix_lens + pid_b)
-    if pid_q * num_q_loop >= q_block_len:
+
+    q_tile_start = pid_q * BLOCK_SIZE_Q
+    if q_tile_start >= q_block_len:
         return
-    real_q_loop = min(num_q_loop, q_block_len - pid_q * num_q_loop)
-    bt_row = block_table_ptr + pid_b * stride_bt_b
+
+    off_q = tl.arange(0, BLOCK_SIZE_Q)
     off_n = tl.arange(0, BLOCK_SIZE_K)
-    off_d = tl.arange(0, BLOCK_SIZE_D)
-    d_mask = off_d < head_dim
-    for j in range(real_q_loop):
-        pid_q_j = pid_q * num_q_loop + j
-        t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
-        # Valid block count from seq position (no sentinel): block_size_q == 1.
-        q_abs = prefix_len + pid_q_j * BLOCK_SIZE_Q
-        valid_blocks = (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K
-        real_topk = tl.minimum(max_topk, valid_blocks)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_qn, stride_qh, stride_qd),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+    q_valid = q_tile_start + off_q < q_block_len
+    q_abs = prefix_len + q_tile_start + off_q
+    real_topk = tl.minimum(
+        max_topk, (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K
+    )
+
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_qn, stride_qh, stride_qd),
+        offsets=(q_tile_start, 0, 0),
+        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+    q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+    causal_offsets = q_abs[:, None] - off_n[None, :]
+    m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
+    acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
+
+    loop_blocks = tl.max(real_topk, axis=0)
+    topk_ptr = (
+        t_ptr
+        + pid_kh * stride_th
+        + (q_block_start + q_tile_start) * stride_tn
+    )
+    for block_iter in tl.range(loop_blocks, disable_licm=True):
+        if TOPK_COVERS_PAGES:
+            blk = block_iter
+            selected_q = q_valid & (blk < real_topk)
+        else:
+            blk = tl.load(topk_ptr + block_iter * stride_tk).to(tl.int32)
+        c = blk * BLOCK_SIZE_K
+        page = tl.load(bt_row + blk).to(tl.int64)
+        pos = c + off_n
+        pos_mask = pos < seq_len
+        k_base_ptr = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
+        k_ptrs = tl.make_block_ptr(
+            base=k_base_ptr,
+            shape=(head_dim, BLOCK_SIZE_K),
+            strides=(stride_kv_d, stride_kv_pos),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_K),
+            order=(0, 1),
         )
-        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
-        off_q = (
-            tl.arange(0, BLOCK_SIZE_Q)[:, None]
-            + pid_q_j * BLOCK_SIZE_Q
-            + prefix_len
-            - tl.arange(0, BLOCK_SIZE_K)[None, :]
+        k = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero")
+        if USE_FP8:
+            k = k.to(q.dtype)
+            if KV_SCALE_MODE == 1:
+                k = (k * tl.load(k_scale_ptr)).to(q.dtype)
+            elif KV_SCALE_MODE == 2:
+                k_scale = tl.load(
+                    k_scale_ptr
+                    + pid_kh * stride_ks_h
+                    + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                    mask=pos_mask,
+                    other=1.0,
+                )
+                k = (k * k_scale[None, :]).to(q.dtype)
+
+        qk = tl.zeros(
+            (BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32
         )
-        m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
-        lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
-        acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
-        q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
-        for _ in range(real_topk):
-            blk = tl.load(t_ptr_j).to(tl.int32)
-            t_ptr_j = t_ptr_j + stride_tk
-            c = blk * BLOCK_SIZE_K
-            page = tl.load(bt_row + blk).to(tl.int64)
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            k = tl.load(
-                kv_cache_ptr
-                + page * stride_kv_blk
-                + pid_kh * stride_kv_h
-                + off_n[None, :] * stride_kv_pos
-                + off_d[:, None] * stride_kv_d,
-                mask=d_mask[:, None] & pos_mask[None, :],
-                other=0.0,
-            )
-            if USE_FP8:
-                k = k.to(q.dtype)
-                if KV_SCALE_MODE == 1:
-                    k = (k * tl.load(k_scale_ptr)).to(q.dtype)
-                elif KV_SCALE_MODE == 2:
-                    k_scale = tl.load(
-                        k_scale_ptr
-                        + pid_kh * stride_ks_h
-                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
-                        mask=pos_mask,
-                        other=1.0,
-                    )
-                    k = (k * k_scale[None, :]).to(q.dtype)
-            qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-            # causal: q_abs_pos - k_off >= block_start (c)
-            qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
-            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
-            qk += tl.dot(q, k) * sm_scale_log2e
+        if (c + BLOCK_SIZE_K) > (prefix_len + q_tile_start):
+            qk += tl.where(causal_offsets[:, None, :] >= c, 0, float("-inf"))
+        qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
+        qk += tl.dot(q, k) * sm_scale_log2e
+        if (c + BLOCK_SIZE_K) > seq_len:
             qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+
+        if TOPK_COVERS_PAGES:
+            active_qh = tl.broadcast_to(
+                selected_q[:, None], (BLOCK_SIZE_Q, BLOCK_SIZE_H)
+            )
+            active_qh = tl.reshape(active_qh, BLOCK_SIZE_QH)
+            qk = tl.where(active_qh[:, None], qk, float("-inf"))
+            block_max = tl.max(qk, axis=1)
+            m_ij = tl.where(active_qh, tl.maximum(m_i, block_max), m_i)
+            p = tl.where(
+                active_qh[:, None], tl.exp2(qk - m_ij[:, None]), 0.0
+            )
+            alpha = tl.where(active_qh, tl.exp2(m_i - m_ij), 1.0)
+        else:
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
             p = tl.exp2(qk - m_ij[:, None])
-            l_ij = tl.sum(p, axis=1)
-            acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-            v = tl.load(
-                kv_cache_ptr
-                + page * stride_kv_blk
-                + pid_kh * stride_kv_h
-                + off_n[:, None] * stride_kv_pos
-                + (head_dim + off_d[None, :]) * stride_kv_d,
-                mask=pos_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
-            if USE_FP8:
-                v = v.to(q.dtype)
-                if KV_SCALE_MODE == 1:
-                    v = (v * tl.load(v_scale_ptr)).to(q.dtype)
-                elif KV_SCALE_MODE == 2:
-                    v_scale = tl.load(
-                        v_scale_ptr
-                        + pid_kh * stride_vs_h
-                        + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
-                        mask=pos_mask,
-                        other=1.0,
-                    )
-                    v = (v * v_scale[:, None]).to(q.dtype)
-            acc_o += tl.dot(p.to(v.dtype), v)
-            m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-        acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
-        acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
-        o_ptrs = tl.make_block_ptr(
-            base=o_ptr + q_start * stride_on + pid_h * stride_oh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_on, stride_oh, stride_od),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+            alpha = tl.exp2(m_i - m_ij)
+        l_ij = tl.sum(p, axis=1)
+        acc_o *= alpha[:, None]
+        l_i = l_i * alpha + l_ij
+
+        v_base_ptr = k_base_ptr + head_dim * stride_kv_d
+        v_ptrs = tl.make_block_ptr(
+            base=v_base_ptr,
+            shape=(BLOCK_SIZE_K, head_dim),
+            strides=(stride_kv_pos, stride_kv_d),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
+            order=(1, 0),
         )
-        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
+        v = tl.load(v_ptrs, boundary_check=(0, 1), padding_option="zero")
+        if USE_FP8:
+            v = v.to(q.dtype)
+            if KV_SCALE_MODE == 1:
+                v = (v * tl.load(v_scale_ptr)).to(q.dtype)
+            elif KV_SCALE_MODE == 2:
+                v_scale = tl.load(
+                    v_scale_ptr
+                    + pid_kh * stride_vs_h
+                    + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
+                    mask=pos_mask,
+                    other=1.0,
+                )
+                v = (v * v_scale[:, None]).to(q.dtype)
+        acc_o += tl.dot(p.to(v.dtype), v)
+        m_i = m_ij
+
+    acc_o *= tl.where(l_i > 0, 1.0 / l_i, 0.0)[:, None]
+    acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
+    o_ptrs = tl.make_block_ptr(
+        base=o_ptr + q_start * stride_on + pid_h * stride_oh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_on, stride_oh, stride_od),
+        offsets=(q_tile_start, 0, 0),
+        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +513,7 @@ def _kv_scale_args(
     if k_scale is None or v_scale is None:
         raise ValueError("k_scale and v_scale must be both provided or both None")
     if k_scale.device != output.device or v_scale.device != output.device:
-        raise ValueError("k_scale and v_scale must be on the same device as output")
+        raise ValueError("k_scale and v_scale must be on the same dvice as output")
     if k_scale.numel() == 1 and v_scale.numel() == 1:
         return k_scale, v_scale, 0, 0, 0, 0, _KV_SCALE_SCALAR
     if k_scale.dim() == 2 and v_scale.dim() == 2:
@@ -527,7 +555,7 @@ def minimax_m3_sparse_attn(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> None:
-    """GQA block-sparse attention over the selected blocks. block_size_q == 1."""
+    """GQA block-sparse attention over the selected KV blocks."""
     total_q, num_heads, head_dim = q.shape
     batch = cu_seqlens_q.shape[0] - 1
     topk = topk_idx.shape[-1]
@@ -554,7 +582,10 @@ def minimax_m3_sparse_attn(
             _KV_SCALE_NONE,
         )
     )
-    grid = (max_query_len, num_kv_heads, batch)
+    block_size_h = triton.next_power_of_2(gqa_group_size)
+    topk_covers_pages = block_table.shape[1] <= topk
+    block_size_q = max(1, 64 // block_size_h) if topk_covers_pages else 1
+    grid = (triton.cdiv(max_query_len, block_size_q), num_kv_heads, batch)
     _gqa_sparse_fwd_kernel[grid](
         q,
         kv_cache,
@@ -564,14 +595,13 @@ def minimax_m3_sparse_attn(
         output,
         block_table,
         cu_seqlens_q,
-        cu_seqlens_q,  # cu_seqblocks_q == cu_seqlens_q when block_size_q == 1
+        cu_seqlens_q,  # top-k metadata still has one row per query token
         seq_lens,
         prefix_lens,
         num_kv_heads,
         gqa_group_size,
         head_dim,
         topk,
-        1,  # num_q_loop
         sm_scale,
         q.stride(0),
         q.stride(1),
@@ -591,8 +621,9 @@ def minimax_m3_sparse_attn(
         output.stride(1),
         output.stride(2),
         block_table.stride(0),
-        BLOCK_SIZE_Q=1,
+        BLOCK_SIZE_Q=block_size_q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        TOPK_COVERS_PAGES=topk_covers_pages,
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
     )
