@@ -114,9 +114,7 @@ def _gqa_sparse_fwd_kernel(
     off_n = tl.arange(0, BLOCK_SIZE_K)
     q_valid = q_tile_start + off_q < q_block_len
     q_abs = prefix_len + q_tile_start + off_q
-    real_topk = tl.minimum(
-        max_topk, (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K
-    )
+    real_topk = tl.minimum(max_topk, (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K)
 
     bt_row = block_table_ptr + pid_b * stride_bt_b
     q_ptrs = tl.make_block_ptr(
@@ -135,11 +133,7 @@ def _gqa_sparse_fwd_kernel(
     acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
 
     loop_blocks = tl.max(real_topk, axis=0)
-    topk_ptr = (
-        t_ptr
-        + pid_kh * stride_th
-        + (q_block_start + q_tile_start) * stride_tn
-    )
+    topk_ptr = t_ptr + pid_kh * stride_th + (q_block_start + q_tile_start) * stride_tn
     for block_iter in tl.range(loop_blocks, disable_licm=True):
         if TOPK_COVERS_PAGES:
             blk = block_iter
@@ -174,9 +168,7 @@ def _gqa_sparse_fwd_kernel(
                 )
                 k = (k * k_scale[None, :]).to(q.dtype)
 
-        qk = tl.zeros(
-            (BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32
-        )
+        qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         if (c + BLOCK_SIZE_K) > (prefix_len + q_tile_start):
             qk += tl.where(causal_offsets[:, None, :] >= c, 0, float("-inf"))
         qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
@@ -192,9 +184,7 @@ def _gqa_sparse_fwd_kernel(
             qk = tl.where(active_qh[:, None], qk, float("-inf"))
             block_max = tl.max(qk, axis=1)
             m_ij = tl.where(active_qh, tl.maximum(m_i, block_max), m_i)
-            p = tl.where(
-                active_qh[:, None], tl.exp2(qk - m_ij[:, None]), 0.0
-            )
+            p = tl.where(active_qh[:, None], tl.exp2(qk - m_ij[:, None]), 0.0)
             alpha = tl.where(active_qh, tl.exp2(m_i - m_ij), 1.0)
         else:
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))

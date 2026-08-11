@@ -378,9 +378,7 @@ def _topk_index_kernel_streaming(
     if pid_q >= block_num:
         return
 
-    valid_blocks = (
-        prefix_len + pid_q * sample_interval + block_size
-    ) // block_size
+    valid_blocks = (prefix_len + pid_q * sample_interval + block_size) // block_size
     off_t = tl.arange(0, BLOCK_SIZE_T)
     ti_ptrs = (
         ti_ptr
@@ -409,9 +407,7 @@ def _topk_index_kernel_streaming(
     init_mask = block_idx < init_blocks
 
     score_row = (
-        s_ptr
-        + (seq_start + pid_q * sample_interval) * stride_s_n
-        + pid_h * stride_s_h
+        s_ptr + (seq_start + pid_q * sample_interval) * stride_s_n + pid_h * stride_s_h
     )
     score = tl.load(
         score_row + block_idx * stride_s_k,
@@ -428,9 +424,7 @@ def _topk_index_kernel_streaming(
     else:
         score = tl.where(causal_mask & local_mask, 1e29, score)
 
-    score_key = _streaming_topk_fpval_to_key(
-        score.to(tl.uint32, bitcast=True)
-    )
+    score_key = _streaming_topk_fpval_to_key(score.to(tl.uint32, bitcast=True))
     index_key = _streaming_topk_index_to_key(block_idx)
     packed = (score_key.to(tl.uint64) << 16) | index_key.to(tl.uint64)
     # A finite sentinel such as -1e30 is not below every valid FP32 value.
@@ -457,9 +451,7 @@ def _topk_index_kernel_streaming(
         else:
             score = tl.where(local_mask, 1e29, score)
 
-        score_key = _streaming_topk_fpval_to_key(
-            score.to(tl.uint32, bitcast=True)
-        )
+        score_key = _streaming_topk_fpval_to_key(score.to(tl.uint32, bitcast=True))
         index_key = _streaming_topk_index_to_key(block_idx)
         packed = (score_key.to(tl.uint64) << 16) | index_key.to(tl.uint64)
         acc = tl.maximum(acc, tl.topk(packed, BLOCK_SIZE_T))
@@ -557,15 +549,9 @@ if _HAS_TLE:
         if pid_q >= block_num:
             return
 
-        valid_blocks = (
-            prefix_len + pid_q * sample_interval + block_size
-        ) // block_size
+        valid_blocks = (prefix_len + pid_q * sample_interval + block_size) // block_size
         off_t = tl.arange(0, BLOCK_SIZE_T)
-        output_row = (
-            ti_ptr
-            + (block_start + pid_q) * stride_ti_n
-            + pid_h * stride_ti_h
-        )
+        output_row = ti_ptr + (block_start + pid_q) * stride_ti_n + pid_h * stride_ti_h
 
         # Per-row Identity path.  It is particularly important for early
         # Prefill queries, whose causal range has not yet grown beyond K.
@@ -640,12 +626,8 @@ if _HAS_TLE:
             counts = tl.load(smem_count_ptrs)
             cumsum_desc = tl.cumsum(counts, axis=0, reverse=True)
             selected_mask = cumsum_desc >= k_to_find
-            selected = tl.max(
-                tl.where(selected_mask, bins, 0), axis=0
-            ).to(tl.int32)
-            counts_gt = tl.max(
-                tl.where(bins == selected + 1, cumsum_desc, 0), axis=0
-            )
+            selected = tl.max(tl.where(selected_mask, bins, 0), axis=0).to(tl.int32)
+            counts_gt = tl.max(tl.where(bins == selected + 1, cumsum_desc, 0), axis=0)
             selected_u32 = selected.to(tl.uint32)
             desired = desired | (selected_u32 << digit_pos)
             desired_mask = desired_mask | (radix_mask_u32 << digit_pos)
@@ -670,15 +652,11 @@ if _HAS_TLE:
                 MASK_INIT,
                 MASK_LOCAL,
             )
-            score_key = _streaming_topk_fpval_to_key(
-                score.to(tl.uint32, bitcast=True)
-            )
+            score_key = _streaming_topk_fpval_to_key(score.to(tl.uint32, bitcast=True))
             take_gt = valid & (score_key > desired)
             take_equal = valid & (score_key == desired)
             equal_rank = tl.cumsum(take_equal.to(tl.int32), axis=0)
-            take_equal = take_equal & (
-                equal_seen + equal_rank <= k_to_find
-            )
+            take_equal = take_equal & (equal_seen + equal_rank <= k_to_find)
             take = take_gt | take_equal
             take_rank = tl.cumsum(take.to(tl.int32), axis=0)
             out_pos = written + take_rank - 1
@@ -1114,9 +1092,9 @@ def minimax_m3_index_score(
     max over a 128-token index-K block. M3 has num_idx_heads == num_kv_heads.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert num_idx_heads == num_kv_heads, (
-        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    )
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
 
@@ -1332,9 +1310,7 @@ def minimax_m3_index_topk(
             )
 
     if path == "streaming":
-        block_size_k, num_warps = _streaming_prefill_launch_config(
-            score.shape[2], topk
-        )
+        block_size_k, num_warps = _streaming_prefill_launch_config(score.shape[2], topk)
         _topk_index_kernel_streaming[grid_topk](
             *kernel_args,
             BLOCK_SIZE_K=block_size_k,
@@ -1375,9 +1351,9 @@ def minimax_m3_index_decode_score(
     with the prefill side and run a single top-k over both.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert num_idx_heads == num_kv_heads, (
-        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    )
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     assert decode_query_len <= max_decode_query_len
     assert total_q == seq_lens.shape[0] * decode_query_len
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
@@ -1477,9 +1453,9 @@ def minimax_m3_index_decode(
     via strides, so a transposed view of a block-major buffer is accepted.
     """
     total_q, num_idx_heads, _ = idx_q.shape
-    assert num_idx_heads == num_kv_heads, (
-        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    )
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     assert decode_query_len <= max_decode_query_len
     assert total_q == seq_lens.shape[0] * decode_query_len
     batch = total_q

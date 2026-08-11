@@ -652,9 +652,7 @@ def test_prefill_topk_radix_path() -> None:
     prefix_lens = torch.tensor(
         [(num_score_blocks - 1) * BLOCK], device="cuda", dtype=torch.int32
     )
-    block_size_k, _ = index_topk_module._radix_prefill_launch_config(
-        num_score_blocks
-    )
+    block_size_k, _ = index_topk_module._radix_prefill_launch_config(num_score_blocks)
     config_key = (block_size_k, topk)
     index_topk_module._FAILED_RADIX_CONFIGS.discard(config_key)
 
