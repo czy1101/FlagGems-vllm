@@ -309,6 +309,36 @@ class IluvatarForkSelectionIntegrationTest(TemporaryRepositoryTestCase):
         )
 
 
+class BenchmarkWorkflowPolicyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        repo_root = Path(__file__).resolve().parents[1]
+        cls.workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+    def test_pull_requests_cannot_enable_benchmarks(self):
+        marker = "          RUN_BENCHMARKS: >-\n"
+        start = self.workflow.index(marker)
+        end = self.workflow.index("        run: |\n", start)
+        expression = " ".join(self.workflow[start:end].split())
+
+        self.assertEqual(
+            expression,
+            "RUN_BENCHMARKS: >- "
+            "${{ github.event_name == 'push' || "
+            "(github.event_name == 'workflow_dispatch' && "
+            "inputs.run_benchmarks == true) }}",
+        )
+
+    def test_disabled_benchmarks_are_removed_from_selected_targets(self):
+        self.assertIn(
+            'if [[ "${RUN_BENCHMARKS}" != "true" ]]; then\n'
+            "            args+=(--no-benchmarks)",
+            self.workflow,
+        )
+
+
 class CiPinsTest(unittest.TestCase):
     def test_three_flaggems_pins_are_identical(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -582,6 +612,9 @@ class CiWorkflowPolicyTest(unittest.TestCase):
         repository_guard = (
             "github.event.pull_request.head.repo.full_name == github.repository"
         )
+        nvidia_label_opt_in = (
+            "contains(github.event.pull_request.labels.*.name, 'ci/nvidia')"
+        )
         nvidia_job = workflow.split("  nvidia-tests:", maxsplit=1)[1].split(
             "  non-nvidia-tests:", maxsplit=1
         )[0]
@@ -590,7 +623,9 @@ class CiWorkflowPolicyTest(unittest.TestCase):
         )[0]
 
         self.assertIn(repository_guard, nvidia_job)
+        self.assertIn(nvidia_label_opt_in, nvidia_job)
         self.assertNotIn(repository_guard, non_nvidia_job)
+        self.assertNotIn(nvidia_label_opt_in, non_nvidia_job)
         self.assertIn(author_guard, nvidia_job)
         self.assertIn(author_guard, non_nvidia_job)
         self.assertNotIn("github.actor != 'dependabot[bot]'", workflow)
