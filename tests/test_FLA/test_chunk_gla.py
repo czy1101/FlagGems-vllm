@@ -21,6 +21,7 @@
 
 import contextlib
 import functools
+import importlib
 import inspect
 import inspect as _inspect
 import os
@@ -35,6 +36,7 @@ import triton.language as tl
 import flaggems_vllm
 from flaggems_vllm.ops.FLA.chunk_gla import chunk_gla
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices as _prepare_chunk_indices
+from flaggems_vllm.runtime import torch_device_fn
 
 
 # --- From fla/ops/utils/op.py: exp ---
@@ -52,8 +54,8 @@ else:
     _autotune_cache_kwargs = {}
 
 # --- From fla/utils.py: autocast helpers ---
-_autocast_custom_fwd = torch.amp.custom_fwd(device_type="cuda")
-_autocast_custom_bwd = torch.amp.custom_bwd(device_type="cuda")
+_autocast_custom_fwd = torch.amp.custom_fwd(device_type=flaggems_vllm.device)
+_autocast_custom_bwd = torch.amp.custom_bwd(device_type=flaggems_vllm.device)
 
 
 # --- From fla/utils.py: input_guard (minimal) ---
@@ -102,8 +104,8 @@ def _input_guard(fn=None, *, no_guard_contiguous=False):
                         tensor = v
                         break
 
-            if tensor is not None and tensor.device.type == "cuda":
-                ctx = torch.cuda.device(tensor.device.index)
+            if tensor is not None:
+                ctx = torch_device_fn.device(tensor.device)
             else:
                 ctx = contextlib.nullcontext()
             with ctx:
@@ -885,14 +887,78 @@ def fused_recurrent_gla(
     return o, final_state
 
 
-def _cuda_available() -> bool:
-    return torch.cuda.is_available() and flaggems_vllm.device == "cuda"
+def _accelerator_available() -> bool:
+    if flaggems_vllm.device not in {"cuda", "npu"}:
+        return False
+    is_available = getattr(torch_device_fn, "is_available", None)
+    return bool(is_available()) if callable(is_available) else False
 
 
 pytestmark = [
     pytest.mark.chunk_gla,
-    pytest.mark.skipif(not _cuda_available(), reason="CUDA required"),
+    pytest.mark.skipif(
+        not _accelerator_available(), reason="CUDA or Ascend NPU required"
+    ),
 ]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _select_test_device():
+    if flaggems_vllm.device not in {"cuda", "npu"}:
+        yield
+        return
+
+    raw_device_id = os.environ.get("FLAGGEMS_TEST_DEVICE_ID", "0")
+    try:
+        device_id = int(raw_device_id)
+    except ValueError:
+        pytest.fail(
+            "FLAGGEMS_TEST_DEVICE_ID must be an integer, "
+            f"got {raw_device_id!r}"
+        )
+
+    device_count = torch_device_fn.device_count()
+    if not 0 <= device_id < device_count:
+        pytest.fail(
+            f"FLAGGEMS_TEST_DEVICE_ID={device_id} is outside the visible "
+            f"{flaggems_vllm.device} device range [0, {device_count})"
+        )
+
+    previous_device = torch_device_fn.current_device()
+    torch_device_fn.set_device(device_id)
+    print(f"[chunk_gla] using {flaggems_vllm.device}:{device_id}")
+    try:
+        yield
+    finally:
+        torch_device_fn.set_device(previous_device)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure_tle_on_ascend():
+    if flaggems_vllm.device != "npu":
+        yield
+        return
+
+    key = "FLA_GLA_TLE"
+    previous = os.environ.get(key)
+    if previous not in {None, "0", "1"}:
+        pytest.fail(f"{key} must be 0 or 1, got {previous!r}")
+
+    selected = previous if previous is not None else "0"
+    chunk_gla_module = importlib.import_module("flaggems_vllm.ops.FLA.chunk_gla")
+    has_tle = bool(chunk_gla_module.HAS_TLE)
+    if selected == "1" and not has_tle:
+        pytest.fail(f"{key}=1 was requested, but FlagTree TLE is unavailable")
+
+    os.environ[key] = selected
+    print(f"[chunk_gla] HAS_TLE={has_tle}, {key}={selected}")
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
 @pytest.fixture(scope="module", autouse=True)

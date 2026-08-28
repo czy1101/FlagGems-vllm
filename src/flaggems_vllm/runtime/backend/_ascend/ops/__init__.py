@@ -12,13 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-from .fused_moe import fused_experts_impl, inplace_fused_experts, outplace_fused_experts
-from .scaled_int8_quant import scaled_int8_quant
+from .chunk_kda import chunk_kda
+from .FLA import chunk_gla, parallel_nsa, parallel_nsa_compression
+from .flash_mla import flash_mla
+from .flash_mla_with_kvcache import flash_mla_with_kvcache
+from .flashmla_sparse import flash_mla_sparse_fwd
 
 __all__ = [
-    "fused_experts_impl",
-    "inplace_fused_experts",
-    "outplace_fused_experts",
-    "scaled_int8_quant",
+    "chunk_gla",
+    "chunk_kda",
+    "flash_mla",
+    "flash_mla_sparse_fwd",
+    "flash_mla_with_kvcache",
+    "parallel_nsa",
+    "parallel_nsa_compression",
 ]
+
+# Some FLA callers import from the FLA package or its implementation module.
+# The backend registry loads this module after the generic FLA package, so
+# update those public bindings to the Ascend implementations as well.
+try:
+    import importlib as _importlib
+
+    import flaggems_vllm.ops.FLA as _fla
+
+    _fla.chunk_gla = chunk_gla
+    _fla.chunk_kda = chunk_kda
+    _fla.parallel_nsa = parallel_nsa
+    _fla.parallel_nsa_compression = parallel_nsa_compression
+
+    _importlib.import_module("flaggems_vllm.ops.FLA.chunk_gla").chunk_gla = chunk_gla
+    _importlib.import_module("flaggems_vllm.ops.FLA.chunk_kda").chunk_kda = chunk_kda
+    _importlib.import_module("flaggems_vllm.ops.FLA.parallel_nsa").parallel_nsa = (
+        parallel_nsa
+    )
+    _importlib.import_module(
+        "flaggems_vllm.ops.FLA.parallel_nsa_compression"
+    ).parallel_nsa_compression = parallel_nsa_compression
+except Exception:
+    # The backend module can also be imported in isolation during packaging.
+    pass

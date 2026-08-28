@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -20,17 +23,19 @@ import triton
 import flaggems_vllm
 from benchmark.conftest import Config
 from flaggems_vllm.ops.FLA.chunk_gla import chunk_gla as gems_chunk_gla
+from flaggems_vllm.runtime import torch_device_fn
 
 # optional FLA reference
 _HAS_FLA_CHUNK = False
 _fla_chunk_gla = None
 
-try:
-    from fla.ops.gla import chunk_gla as _fla_chunk_gla
+if flaggems_vllm.device == "cuda":
+    try:
+        from fla.ops.gla import chunk_gla as _fla_chunk_gla
 
-    _HAS_FLA_CHUNK = True
-except Exception:
-    _HAS_FLA_CHUNK = False
+        _HAS_FLA_CHUNK = True
+    except Exception:
+        _HAS_FLA_CHUNK = False
 
 
 def _fla_chunk_wrapper(q, k, v, g, **kwargs):
@@ -84,7 +89,7 @@ def _precompile():
             _fla_chunk_wrapper(q, k, v, g, **kwargs)
         gems_chunk_gla(q, k, v, g, **kwargs)
 
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
 
 def _bench_ms(fn):
@@ -162,8 +167,11 @@ _SHAPES = [
     (4, 2048, 16, 128),
     (4, 4096, 64, 128),
     (8, 2048, 32, 256),
-    (2, 2048, 16, 512),
     (4, 1024, 8, 512),
+    (8, 1024, 8, 64),
+]
+
+_CORE_SHAPES = [
     (8, 1024, 8, 64),
 ]
 
@@ -204,12 +212,84 @@ def _print_row(B, T, H, D, dtype, ms_fla, ms_gems):
         print(f"{B:>3} {T:>6} {H:>4} {D:>4} {dtype_str:>8} " f"{ms_gems:>10.3f}")
 
 
+def _accelerator_available() -> bool:
+    if flaggems_vllm.device not in {"cuda", "npu"}:
+        return False
+    is_available = getattr(torch_device_fn, "is_available", None)
+    return bool(is_available()) if callable(is_available) else False
+
+
+def _selected_shapes():
+    if Config.bench_level.value == "core":
+        return _CORE_SHAPES
+    return _SHAPES
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _select_test_device():
+    if flaggems_vllm.device not in {"cuda", "npu"}:
+        yield
+        return
+
+    raw_device_id = os.environ.get("FLAGGEMS_TEST_DEVICE_ID", "0")
+    try:
+        device_id = int(raw_device_id)
+    except ValueError:
+        pytest.fail(
+            "FLAGGEMS_TEST_DEVICE_ID must be an integer, "
+            f"got {raw_device_id!r}"
+        )
+
+    device_count = torch_device_fn.device_count()
+    if not 0 <= device_id < device_count:
+        pytest.fail(
+            f"FLAGGEMS_TEST_DEVICE_ID={device_id} is outside the visible "
+            f"{flaggems_vllm.device} device range [0, {device_count})"
+        )
+
+    previous_device = torch_device_fn.current_device()
+    torch_device_fn.set_device(device_id)
+    print(f"[chunk_gla benchmark] using {flaggems_vllm.device}:{device_id}")
+    try:
+        yield
+    finally:
+        torch_device_fn.set_device(previous_device)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure_tle_on_ascend():
+    if flaggems_vllm.device != "npu":
+        yield
+        return
+
+    key = "FLA_GLA_TLE"
+    previous = os.environ.get(key)
+    if previous not in {None, "0", "1"}:
+        pytest.fail(f"{key} must be 0 or 1, got {previous!r}")
+
+    selected = previous if previous is not None else "0"
+    chunk_gla_module = importlib.import_module("flaggems_vllm.ops.FLA.chunk_gla")
+    has_tle = bool(chunk_gla_module.HAS_TLE)
+    if selected == "1" and not has_tle:
+        pytest.fail(f"{key}=1 was requested, but FlagTree TLE is unavailable")
+
+    os.environ[key] = selected
+    print(f"[chunk_gla benchmark] HAS_TLE={has_tle}, {key}={selected}")
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
 # ---------------------------
 # unified benchmark (fwd then fwd+bwd)
 # ---------------------------
 @pytest.mark.skipif(
-    flaggems_vllm.device != "cuda",
-    reason="benchmark requires CUDA device",
+    not _accelerator_available(),
+    reason="benchmark requires CUDA or Ascend NPU",
 )
 @pytest.mark.chunk_gla
 def test_perf_chunk_gla():
@@ -223,11 +303,11 @@ def test_perf_chunk_gla():
     )
 
     _precompile()
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     for dtype in _DTYPES:
         print("\ndtype:", dtype)
-        for B, T, H, D in _SHAPES:
+        for B, T, H, D in _selected_shapes():
             q, k, v, g, kwargs = _build_inputs(B, T, H, D, dtype)
 
             ms_fla = None
@@ -267,11 +347,11 @@ def test_perf_chunk_gla():
         for p in [wq, wk, wv, wg_logit]:
             if p.grad is not None:
                 p.grad.zero_()
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     for dtype in _DTYPES:
         print("\ndtype:", dtype)
-        for B, T, H, D in _SHAPES:
+        for B, T, H, D in _selected_shapes():
             q, k, v, g_logit, kwargs = _build_inputs(
                 B, T, H, D, dtype, requires_grad=True
             )

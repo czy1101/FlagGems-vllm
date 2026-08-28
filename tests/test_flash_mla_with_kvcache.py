@@ -22,6 +22,8 @@ import math
 import pytest
 import torch
 
+import flaggems_vllm
+
 # CUDA reference
 try:
     from vllm.third_party.flashmla.flash_mla_interface import (
@@ -44,8 +46,10 @@ from flaggems_vllm.ops.flash_mla_with_kvcache import (
     get_mla_metadata as triton_get_mla_metadata,
 )
 
-DEVICE = "cuda"
+DEVICE = flaggems_vllm.device
 CUDA_AVAILABLE = torch.cuda.is_available()
+IS_CUDA = DEVICE == "cuda"
+IS_NPU = DEVICE == "npu"
 FP8_MAX = 448.0
 
 
@@ -53,6 +57,10 @@ def generate_v32_fp8_kv_cache(
     num_pages, page_block_size, h_k=1, d_nope=512, d_rope=64, device=DEVICE
 ):
     """Generate V32 FP8 KV cache: 512 FP8 + 4 FP32 scales + 64 BF16."""
+    target_device = device
+    if device == "npu":
+        # torch-npu 2.9 cannot perform a device-side BF16/FP32 -> float8 cast.
+        device = "cpu"
     total_tokens = num_pages * page_block_size
 
     nope_data = (
@@ -88,7 +96,7 @@ def generate_v32_fp8_kv_cache(
         .view(torch.uint8)
         .reshape(num_pages, page_block_size, h_k, 128)
     )
-    return kv_cache
+    return kv_cache.to(target_device) if target_device != device else kv_cache
 
 
 def generate_model1_fp8_kv_cache(
@@ -96,6 +104,10 @@ def generate_model1_fp8_kv_cache(
 ):
     """Generate MODEL1 page-oriented cache: page data first, then E8M0 scales."""
     assert h_k == 1, "FlashMLA sparse decode currently supports h_k == 1"
+    target_device = device
+    if device == "npu":
+        # Keep FP8 packing on CPU; only the final uint8 cache is device data.
+        device = "cpu"
     total_tokens = num_pages * page_block_size
     token_data_bytes = d_nope + d_rope * 2
     scale_bytes = 8
@@ -137,7 +149,135 @@ def generate_model1_fp8_kv_cache(
     page_flat[:, page_block_size * token_data_bytes :] = encoded_scales.reshape(
         num_pages, page_block_size * scale_bytes
     )
-    return kv_cache
+    return kv_cache.to(target_device) if target_device != device else kv_cache
+
+
+def _decode_fp8_cache(k_cache):
+    """Decode the two FlashMLA byte layouts for the NPU reference path.
+
+    The reference deliberately runs the byte reinterpretation on CPU because
+    torch-npu does not expose all float8 view/conversion combinations.  The
+    resulting dense BF16-compatible K/V tensor is copied back to the input
+    device before attention is evaluated.
+    """
+    num_pages, page_size, h_k, width = k_cache.shape
+    pages = k_cache.detach().cpu()
+    if width == 656:
+        tokens = pages.reshape(-1, width)
+        nope = tokens[:, :512].contiguous().view(torch.float8_e4m3fn).float()
+        scales = tokens[:, 512:528].contiguous().view(torch.float32)
+        nope = nope * scales.repeat_interleave(128, dim=1)
+        rope = tokens[:, 528:656].contiguous().view(torch.bfloat16).float()
+        dense = torch.cat((nope, rope), dim=-1).reshape(
+            num_pages, page_size, h_k, 576
+        )
+    elif width == 584:
+        page_flat = pages.reshape(num_pages, -1)
+        token_data = page_flat[:, : page_size * 576].reshape(-1, 576)
+        scale_data = page_flat[:, page_size * 576 :].reshape(-1, 8)
+        nope = token_data[:, :448].contiguous().view(torch.float8_e4m3fn).float()
+        exponents = scale_data[:, :7].float() - 127.0
+        nope = nope * torch.pow(2.0, exponents.repeat_interleave(64, dim=1))
+        rope = token_data[:, 448:576].contiguous().view(torch.bfloat16).float()
+        dense = torch.cat((nope, rope), dim=-1).reshape(
+            num_pages, page_size, h_k, 512
+        )
+    else:
+        raise ValueError(f"unsupported cache width: {width}")
+    return dense.to(device=k_cache.device, dtype=torch.float32)
+
+
+def _torch_sparse_reference(
+    q,
+    k_cache,
+    head_dim_v,
+    indices,
+    attn_sink=None,
+    topk_length=None,
+    extra_k_cache=None,
+    extra_indices_in_kvcache=None,
+    extra_topk_length=None,
+):
+    dense_decoded = _decode_fp8_cache(k_cache)
+    dense = dense_decoded.reshape(
+        -1, dense_decoded.shape[2], dense_decoded.shape[-1]
+    )
+    if extra_k_cache is not None:
+        extra_decoded = _decode_fp8_cache(extra_k_cache)
+        extra_dense = extra_decoded.reshape(
+            -1, extra_decoded.shape[2], extra_decoded.shape[-1]
+        )
+    else:
+        extra_dense = None
+    batch, seq_q, h_q, d_qk = q.shape
+    output = torch.zeros(
+        batch, seq_q, h_q, head_dim_v, dtype=q.dtype, device=q.device
+    )
+    lse = torch.empty(batch, h_q, seq_q, dtype=torch.float32, device=q.device)
+    scale = d_qk**-0.5
+    for b in range(batch):
+        for s in range(seq_q):
+            primary_len = (
+                int(topk_length[b].item())
+                if topk_length is not None
+                else indices.shape[-1]
+            )
+            primary_ids = indices[b, s, :primary_len].long()
+            primary_valid = (primary_ids >= 0) & (primary_ids < dense.shape[0])
+            primary_ids = primary_ids.clamp(0, dense.shape[0] - 1)
+            gathered = dense[primary_ids, 0]
+            valid_parts = [primary_valid]
+            if extra_dense is not None:
+                extra_len = (
+                    int(extra_topk_length[b].item())
+                    if extra_topk_length is not None
+                    else extra_indices_in_kvcache.shape[-1]
+                )
+                extra_ids = extra_indices_in_kvcache[b, s, :extra_len].long()
+                extra_valid = (extra_ids >= 0) & (extra_ids < extra_dense.shape[0])
+                extra_ids = extra_ids.clamp(0, extra_dense.shape[0] - 1)
+                gathered = torch.cat((gathered, extra_dense[extra_ids, 0]), dim=0)
+                valid_parts.append(extra_valid)
+            valid = torch.cat(valid_parts)
+            scores = q[b, s].float() @ gathered.transpose(0, 1)
+            scores = scores * scale
+            scores = scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
+            row_lse = torch.logsumexp(scores, dim=-1)
+            lse[b, :, s] = row_lse
+            if attn_sink is not None:
+                output_lse = torch.logaddexp(row_lse, attn_sink)
+            else:
+                output_lse = row_lse
+            probs = torch.exp(scores - output_lse.unsqueeze(-1))
+            output[b, s] = (probs @ gathered[:, :head_dim_v]).to(q.dtype)
+    return output, lse
+
+
+def _torch_dense_reference(q, k_cache, block_table, cache_seqlens, head_dim_v):
+    batch, seq_q, h_q, d_qk = q.shape
+    flat_cache = k_cache.reshape(-1, k_cache.shape[2], d_qk)
+    output = torch.empty(
+        batch, seq_q, h_q, head_dim_v, dtype=q.dtype, device=q.device
+    )
+    lse = torch.empty(batch, h_q, seq_q, dtype=torch.float32, device=q.device)
+    scale = d_qk**-0.5
+    for b in range(batch):
+        length = int(cache_seqlens[b].item())
+        page_size = k_cache.shape[1]
+        page_ids = block_table[b, : math.ceil(length / page_size)].long()
+        token_ids = (
+            page_ids[:, None] * page_size
+            + torch.arange(page_size, device=q.device)[None, :]
+        ).reshape(-1)[:length]
+        keys = flat_cache[token_ids, 0].float()
+        for s in range(seq_q):
+            scores = q[b, s].float() @ keys.transpose(0, 1)
+            scores = scores * scale
+            row_lse = torch.logsumexp(scores, dim=-1)
+            lse[b, :, s] = row_lse
+            probs = torch.softmax(scores, dim=-1)
+            output[b, s] = (probs @ keys[:, :head_dim_v]).to(q.dtype)
+    return output, lse
 
 
 def check_close(triton_out, cuda_out, name, cos_threshold=0.99):
@@ -155,6 +295,24 @@ def check_close(triton_out, cuda_out, name, cos_threshold=0.99):
 
 
 def _run_cuda(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
+    if not IS_CUDA:
+        if kwargs.get("is_fp8_kvcache", False):
+            reference = _torch_sparse_reference(
+                q,
+                k_cache,
+                head_dim_v,
+                kwargs["indices"],
+                kwargs.get("attn_sink"),
+                kwargs.get("topk_length"),
+                kwargs.get("extra_k_cache"),
+                kwargs.get("extra_indices_in_kvcache"),
+                kwargs.get("extra_topk_length"),
+            )
+            if kwargs.get("out") is not None:
+                kwargs["out"].copy_(reference[0])
+                return kwargs["out"], reference[1]
+            return reference
+        return _torch_dense_reference(q, k_cache, block_table, cache_seqlens, head_dim_v)
     cuda_meta, _ = cuda_get_mla_metadata()
     return cuda_flash_mla(
         q, k_cache, block_table, cache_seqlens, head_dim_v, cuda_meta, **kwargs
@@ -168,13 +326,10 @@ def _run_triton(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
     )
 
 
-pytestmark = [
-    pytest.mark.flash_mla_with_kvcache,
-    pytest.mark.skipif(
-        not (VLLM_AVAILABLE and CUDA_AVAILABLE),
-        reason="vLLM FlashMLA and CUDA are required",
-    ),
-]
+pytestmark = pytest.mark.skipif(
+    IS_CUDA and not (VLLM_AVAILABLE and CUDA_AVAILABLE),
+    reason="vLLM FlashMLA and CUDA are required",
+)
 
 
 @pytest.mark.parametrize(

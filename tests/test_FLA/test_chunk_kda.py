@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 
 import pytest
 import torch
@@ -20,19 +21,57 @@ import torch.nn.functional as F
 
 import flaggems_vllm
 from flaggems_vllm.ops.FLA import chunk_kda
+from flaggems_vllm.runtime import torch_device_fn
 
 LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
 
 
-def _cuda_available() -> bool:
-    return torch.cuda.is_available() and flaggems_vllm.device == "cuda"
+def _accelerator_available() -> bool:
+    if flaggems_vllm.device not in {"cuda", "npu"}:
+        return False
+    is_available = getattr(torch_device_fn, "is_available", None)
+    return bool(is_available()) if callable(is_available) else False
 
 
 pytestmark = [
     pytest.mark.chunk_kda,
-    pytest.mark.skipif(not _cuda_available(), reason="chunk_kda tests require CUDA"),
+    pytest.mark.skipif(
+        not _accelerator_available(),
+        reason="chunk_kda tests require CUDA or Ascend NPU",
+    ),
 ]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _select_test_device():
+    if flaggems_vllm.device not in {"cuda", "npu"}:
+        yield
+        return
+
+    raw_device_id = os.environ.get("FLAGGEMS_TEST_DEVICE_ID", "0")
+    try:
+        device_id = int(raw_device_id)
+    except ValueError:
+        pytest.fail(
+            "FLAGGEMS_TEST_DEVICE_ID must be an integer, "
+            f"got {raw_device_id!r}"
+        )
+
+    device_count = torch_device_fn.device_count()
+    if not 0 <= device_id < device_count:
+        pytest.fail(
+            f"FLAGGEMS_TEST_DEVICE_ID={device_id} is outside the visible "
+            f"{flaggems_vllm.device} device range [0, {device_count})"
+        )
+
+    previous_device = torch_device_fn.current_device()
+    torch_device_fn.set_device(device_id)
+    print(f"[chunk_kda] using {flaggems_vllm.device}:{device_id}")
+    try:
+        yield
+    finally:
+        torch_device_fn.set_device(previous_device)
 
 
 def _naive_kda_lowerbound_gate(
@@ -271,6 +310,21 @@ def _assert_close(
                 "output_final_state": True,
             },
             id="dense",
+        ),
+        pytest.param(
+            {
+                "seq_lens": [96],
+                "H": 2,
+                "HV": 2,
+                "D": 64,
+                "scale": 1 / math.sqrt(64),
+                "dtype": torch.bfloat16,
+                "state_v_first": True,
+                "normal_inputs": True,
+                "use_initial_state": True,
+                "output_final_state": True,
+            },
+            id="multichunk_96",
         ),
         pytest.param(
             {

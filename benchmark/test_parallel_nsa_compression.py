@@ -12,12 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 import torch
 import triton
 
 import flaggems_vllm
 from benchmark.base import Benchmark
+
+# Keep the benchmark backend-neutral: both NVIDIA CUDA and Ascend NPU are
+# supported.  Only unsupported/CPU-only environments are skipped; do not use
+# torch.cuda.is_available(), which would incorrectly skip valid NPU runs.
+pytestmark = pytest.mark.skipif(
+    flaggems_vllm.device not in {"cuda", "npu"},
+    reason="parallel_nsa_compression benchmark requires a CUDA or Ascend NPU backend",
+)
 
 
 class ParallelNSACompressionBenchmark(Benchmark):
@@ -43,7 +53,12 @@ class ParallelNSACompressionBenchmark(Benchmark):
         return self.DEFAULT_SHAPES
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = self.DEFAULT_SHAPES
+        selected = os.environ.get("FLAGGEMS_NSA_BENCH_SHAPES")
+        if selected:
+            indices = {int(item.strip()) for item in selected.split(",") if item.strip()}
+            self.shapes = [shape for i, shape in enumerate(self.DEFAULT_SHAPES) if i in indices]
+        else:
+            self.shapes = self.DEFAULT_SHAPES
         self.shape_desc = self.DEFAULT_SHAPE_DESC
 
     def get_input_iter(self, cur_dtype):

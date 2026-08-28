@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 from flaggems_vllm.runtime import backend
 from flaggems_vllm.runtime.backend.device import DeviceDetector
 
@@ -28,12 +30,25 @@ try:
     backend.set_tl_extra_backend_module(device.vendor_name)
     tl_extra_shim = backend.get_tl_extra_backend_module()
 except ImportError:
-    import triton
-
-    try:
-        tl_extra_shim = triton.language.math
-    except ImportError:
-        tl_extra_shim = triton.language.libdevice
+    required_symbols = ("erf", "exp", "pow", "tanh")
+    fallback_modules = (
+        "triton.language.extra.libdevice",
+        "triton.language.math",
+        "triton.language.libdevice",
+    )
+    for module_name in fallback_modules:
+        try:
+            candidate = importlib.import_module(module_name)
+        except (AttributeError, ImportError):
+            continue
+        if all(hasattr(candidate, symbol) for symbol in required_symbols):
+            tl_extra_shim = candidate
+            break
+    else:
+        raise ImportError(
+            "No Triton math module provides all required symbols: "
+            + ", ".join(required_symbols)
+        )
 
 
 def use_backend(module):

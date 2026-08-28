@@ -14,6 +14,7 @@
 
 import itertools
 import math
+import os
 
 import pytest
 import torch
@@ -22,6 +23,7 @@ import torch.nn.functional as F
 import flaggems_vllm
 from benchmark.base import Benchmark
 from flaggems_vllm.ops.FLA import chunk_kda
+from flaggems_vllm.runtime import torch_device_fn
 
 LOWER_BOUND = -5.0
 DEFAULT_H = 96
@@ -263,10 +265,13 @@ class ChunkKDABenchmark(Benchmark):
 
 
 @pytest.mark.skipif(
-    flaggems_vllm.device != "cuda", reason="chunk_kda benchmark requires CUDA"
+    flaggems_vllm.device not in {"cuda", "npu"},
+    reason="chunk_kda benchmark requires CUDA or Ascend NPU",
 )
 @pytest.mark.chunk_kda
 def test_chunk_kda():
+    device_id = int(os.environ.get("FLAGGEMS_TEST_DEVICE_ID", "0"))
+    torch_device_fn.set_device(device_id)
     bench = ChunkKDABenchmark(
         op_name="chunk_kda",
         torch_op=_chunk_kda_torch_reference_op,

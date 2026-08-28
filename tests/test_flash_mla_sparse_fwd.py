@@ -22,6 +22,7 @@ import torch
 import flaggems_vllm
 
 random.seed(42)
+IS_CUDA = flaggems_vllm.device == "cuda"
 
 try:
     from vllm.v1.attention.ops.flashmla import (
@@ -316,13 +317,13 @@ class FlashmlaSparseTestKit:
 def test_flashmla_sparse(param):
     """Sparse MLA forward propagation test"""
     # Skip FlashMLA unsupported cases
-    if param.h_q != 64 and param.h_q != 128:
+    if IS_CUDA and param.h_q != 64 and param.h_q != 128:
         # RuntimeError: Unsupported h_q: 256
         # FlashMLA csrc/api/sparse_fwd.h:197
         # FlashMLA requires that h_q is 64 or 128
         return
 
-    if param.topk % 128 != 0:
+    if IS_CUDA and param.topk % 128 != 0:
         # Assertion `params.topk % (2*B_TOPK) == 0` failed
         # FlashMLA csrc/sm90/prefill/sparse/phase1.cuh:577
         # FlashMLA csrc/sm90/prefill/sparse/config.h:27 "B_TOPK = 64"

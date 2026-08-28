@@ -14,7 +14,9 @@
 
 import dataclasses
 import math
+import os
 import random
+import time
 from typing import Optional
 
 import pytest
@@ -35,6 +37,13 @@ try:
     HAS_CUDA_FLASHMLA = True
 except ImportError:
     HAS_CUDA_FLASHMLA = False
+
+IS_CUDA = flaggems_vllm.device == "cuda"
+if not HAS_CUDA_FLASHMLA:
+    from tests.test_flash_mla_with_kvcache import (
+        _torch_dense_reference,
+        _torch_sparse_reference,
+    )
 
 from flaggems_vllm.ops.flash_mla_with_kvcache import (
     flash_mla_with_kvcache as triton_flash_mla,
@@ -80,9 +89,17 @@ def _init_seed(seed):
 
 
 def generate_v32_fp8_kv_cache(
-    num_pages, page_block_size, h_kv=1, d_nope=512, d_rope=64, device="cuda"
+    num_pages,
+    page_block_size,
+    h_kv=1,
+    d_nope=512,
+    d_rope=64,
+    device=flaggems_vllm.device,
 ):
     """Generate V32 FP8 KV cache data (656 bytes per token)."""
+    target_device = device
+    if device == "npu":
+        device = "cpu"
     total_tokens = num_pages * page_block_size
 
     nope_data = (
@@ -118,14 +135,22 @@ def generate_v32_fp8_kv_cache(
         .view(torch.uint8)
         .reshape(num_pages, page_block_size, h_kv, 128)
     )
-    return kv_cache
+    return kv_cache.to(target_device) if target_device != device else kv_cache
 
 
 def generate_model1_fp8_kv_cache(
-    num_pages, page_block_size, h_kv=1, d_nope=448, d_rope=64, device="cuda"
+    num_pages,
+    page_block_size,
+    h_kv=1,
+    d_nope=448,
+    d_rope=64,
+    device=flaggems_vllm.device,
 ):
     """Generate MODEL1 page-oriented KV cache data (584 bytes per token)."""
     assert h_kv == 1, "FlashMLA sparse decode currently supports h_kv == 1"
+    target_device = device
+    if device == "npu":
+        device = "cpu"
     total_tokens = num_pages * page_block_size
     token_data_bytes = d_nope + d_rope * 2
     scale_bytes = 8
@@ -167,7 +192,7 @@ def generate_model1_fp8_kv_cache(
     page_flat[:, page_block_size * token_data_bytes :] = encoded_scales.reshape(
         num_pages, page_block_size * scale_bytes
     )
-    return kv_cache
+    return kv_cache.to(target_device) if target_device != device else kv_cache
 
 
 def _cuda_wrapper(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
@@ -175,6 +200,31 @@ def _cuda_wrapper(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
     return cuda_flash_mla(
         q, k_cache, block_table, cache_seqlens, head_dim_v, meta, **kwargs
     )
+
+
+def _reference_wrapper(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
+    if HAS_CUDA_FLASHMLA:
+        return _cuda_wrapper(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs)
+    if kwargs.get("is_fp8_kvcache", False):
+        result = _torch_sparse_reference(
+            q,
+            k_cache,
+            head_dim_v,
+            kwargs["indices"],
+            kwargs.get("attn_sink"),
+            kwargs.get("topk_length"),
+            kwargs.get("extra_k_cache"),
+            kwargs.get("extra_indices_in_kvcache"),
+            kwargs.get("extra_topk_length"),
+        )
+    else:
+        result = _torch_dense_reference(
+            q, k_cache, block_table, cache_seqlens, head_dim_v
+        )
+    if kwargs.get("out") is not None:
+        kwargs["out"].copy_(result[0])
+        return kwargs["out"], result[1]
+    return result
 
 
 def _triton_wrapper(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
@@ -188,7 +238,7 @@ class FlashMLAWithKVCacheBenchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
             "flash_mla_with_kvcache",
-            _cuda_wrapper,
+            _reference_wrapper,
             [torch.bfloat16],
         )
         self.set_gems(_triton_wrapper)
@@ -196,9 +246,46 @@ class FlashMLAWithKVCacheBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = []
 
+    @staticmethod
+    def _single_npu_benchmark_enabled():
+        return (
+            flaggems_vllm.device == "npu"
+            and os.environ.get("FLAGGEMS_KVCACHE_BENCH_SINGLE_RUN", "0") == "1"
+        )
+
+    def get_latency(self, op, *args, **kwargs):
+        """Use one synchronized call for opt-in NPU long-shape diagnostics.
+
+        The normal benchmark path (including all CUDA behavior) remains the
+        base implementation.  On Ascend, one call makes it possible to
+        complete and observe the 13-case sweep without multiplying a
+        multi-second dense decode by warmup/repetition/autotune calls.
+        """
+        if not self._single_npu_benchmark_enabled():
+            return super().get_latency(op, *args, **kwargs)
+        start = time.perf_counter()
+        op(*args, **kwargs)
+        torch.npu.synchronize()
+        return (time.perf_counter() - start) * 1000.0
+
     def get_input_iter(self, dtype):
         _ = dtype
-        for param in self.get_performance_test_params():
+        cases = self.get_performance_test_params()
+        selected = os.environ.get("FLAGGEMS_KVCACHE_BENCH_CASE")
+        if selected:
+            index = int(selected) - 1
+            if index < 0 or index >= len(cases):
+                raise ValueError(
+                    f"FLAGGEMS_KVCACHE_BENCH_CASE must be 1..{len(cases)}"
+                )
+            cases = [cases[index]]
+        for offset, param in enumerate(cases, start=1):
+            print(
+                f"[flash_mla_with_kvcache benchmark] case {offset}/{len(cases)} "
+                f"batch={param.batch} topk={param.topk} seqlen={param.seqlen} "
+                f"h_q={param.h_q} d_qk={param.d_qk} is_fp8={param.is_fp8}",
+                flush=True,
+            )
             yield from self.make_input(param)
 
     @staticmethod
@@ -397,7 +484,6 @@ class FlashMLAWithKVCacheBenchmark(base.Benchmark):
 
 
 @pytest.mark.flash_mla_with_kvcache
-@pytest.mark.skipif(not HAS_CUDA_FLASHMLA, reason="vLLM FlashMLA not installed")
 def test_flash_mla_with_kvcache():
     bench = FlashMLAWithKVCacheBenchmark()
     bench.run()

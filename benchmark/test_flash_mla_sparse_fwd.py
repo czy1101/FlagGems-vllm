@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import dataclasses
+import os
 import random
+import time
 from typing import List
 
 import pytest
@@ -31,6 +33,52 @@ try:
     HAS_VLLM_FLASHMLA_SPARSE = True
 except ImportError:
     HAS_VLLM_FLASHMLA_SPARSE = False
+
+
+def torch_flash_mla_sparse_fwd(
+    q, kv, indices, sm_scale, d_v, attn_sink=None, topk_length=None
+):
+    """Device-portable Torch reference used when vLLM CUDA is absent.
+
+    Query blocking keeps the reference bounded for the largest sparse benchmark
+    shape; it does not change the mathematical reference or the kernel under test.
+    """
+    s_q, h_q, d_qk = q.shape
+    topk = indices.shape[-1]
+    ids = indices.clone().squeeze(1)
+    if topk_length is not None:
+        mask = torch.arange(topk, device=ids.device)[None, :] >= topk_length[:, None]
+        ids[mask] = -1
+    invalid = (ids < 0) | (ids >= kv.shape[0])
+    safe_ids = ids.masked_fill(invalid, 0)
+    ref_q_chunk = max(1, int(os.environ.get("FLAGGEMS_SPARSE_REF_Q_CHUNK", "256")))
+    output = torch.empty((s_q, h_q, d_v), dtype=torch.bfloat16, device=q.device)
+    max_logits = torch.empty((s_q, h_q), dtype=torch.float32, device=q.device)
+    orig_lse = torch.empty((s_q, h_q), dtype=torch.float32, device=q.device)
+    for start in range(0, s_q, ref_q_chunk):
+        end = min(start + ref_q_chunk, s_q)
+        ids_chunk = safe_ids[start:end]
+        invalid_chunk = invalid[start:end]
+        gathered = kv.index_select(0, ids_chunk.reshape(-1)).reshape(
+            end - start, topk, d_qk
+        )
+        scores = torch.matmul(
+            q[start:end].float(), gathered.float().transpose(1, 2)
+        ) * sm_scale
+        scores = scores.masked_fill(invalid_chunk[:, None, :], float("-inf"))
+        lse_chunk = torch.logsumexp(scores, dim=-1)
+        output_lse = (
+            torch.logaddexp(lse_chunk, attn_sink[None, :])
+            if attn_sink is not None
+            else lse_chunk
+        )
+        probs = torch.exp(scores - output_lse[:, :, None])
+        output[start:end] = torch.matmul(probs, gathered[:, :, :d_v]).to(
+            torch.bfloat16
+        )
+        max_logits[start:end] = scores.max(dim=-1).values
+        orig_lse[start:end] = lse_chunk
+    return output, max_logits, orig_lse
 
 
 @dataclasses.dataclass
@@ -60,17 +108,56 @@ _flashmla_sparse_counter = 0
 
 class FlashmlaSparseBenchmark(base.Benchmark):
     def __init__(self):
+        reference = (
+            vllm_flash_mla_sparse_fwd
+            if HAS_VLLM_FLASHMLA_SPARSE
+            else torch_flash_mla_sparse_fwd
+        )
         super().__init__(
-            "flash_mla_sparse_fwd", vllm_flash_mla_sparse_fwd, [torch.bfloat16]
+            "flash_mla_sparse_fwd", reference, [torch.bfloat16]
         )
         self.set_gems(flaggems_vllm.flash_mla_sparse_fwd)
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = []
 
+    @staticmethod
+    def _single_npu_benchmark_enabled():
+        return (
+            flaggems_vllm.device == "npu"
+            and os.environ.get("FLAGGEMS_SPARSE_BENCH_SINGLE_RUN", "0")
+            == "1"
+        )
+
+    def get_latency(self, op, *args, **kwargs):
+        """Measure one synchronized call for the slow NPU fallback path.
+
+        Triton's default ``do_bench`` first executes several calibration calls.
+        The largest sparse shape takes minutes per generic Triton call on 910B,
+        so calibration would multiply one shape into hours. CUDA and the normal
+        benchmark path retain the upstream timing behavior.
+        """
+        if not self._single_npu_benchmark_enabled():
+            return super().get_latency(op, *args, **kwargs)
+        start = time.perf_counter()
+        op(*args, **kwargs)
+        torch.npu.synchronize()
+        return (time.perf_counter() - start) * 1000.0
+
     def get_input_iter(self, dtype):
         _ = dtype
-        for param in FlashmlaSparseBenchmark.get_performance_test_params_flashmla():
+        params = FlashmlaSparseBenchmark.get_performance_test_params_flashmla()
+        selected = os.environ.get("FLAGGEMS_SPARSE_BENCH_CASE")
+        for case_index, param in enumerate(params, start=1):
+            if selected and selected != str(case_index):
+                continue
+            print(
+                "[flash_mla_sparse benchmark] "
+                f"case {case_index}/{len(params)} "
+                f"sq={param.s_q} skv={param.s_kv} hq={param.h_q} "
+                f"dqk={param.d_qk} topk={param.topk}",
+                flush=True,
+            )
             yield from FlashmlaSparseBenchmark.make_input_flashmla(param)
 
     @staticmethod
@@ -203,7 +290,6 @@ class FlashmlaSparseBenchmark(base.Benchmark):
 
 
 @pytest.mark.flash_mla_sparse_fwd
-@pytest.mark.skipif(not HAS_VLLM_FLASHMLA_SPARSE, reason="vLLM not installed")
 def test_flash_mla_sparse_fwd():
     bench = FlashmlaSparseBenchmark()
     bench.run()
