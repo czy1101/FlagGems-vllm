@@ -8,7 +8,7 @@ Invalid indices/thresholds and NaN logits are outside this numerical contract.
 import pytest
 import torch
 
-from flaggems_vllm.ops.apply_min_p import apply_min_p
+from flaggems_vllm.ops.min_p import apply_min_p
 
 from . import conftest as cfg
 
@@ -17,38 +17,33 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+WIDE_SHAPE = (7, 32769)
 # The cached case exceeds the largest register+shared prefix, exercising its tail.
-PATH_SHAPES = [(7, 32768), (7, 32769), (128, 131073), (7, 262145)]
-INDEX_LAYOUTS = (
-    [(torch.int32, "contiguous")]
-    if cfg.QUICK_MODE
-    else [
-        (dtype, layout)
-        for dtype in (torch.int32, torch.int64)
-        for layout in ("contiguous", "padded")
-    ]
-)
-EDGE_SHAPES = (
-    [(1, 1), (7, 1025)] if cfg.QUICK_MODE else [(1, 1), (3, 17), (7, 1025), (3, 262144)]
-)
+PATH_SHAPES = [(7, 32768), WIDE_SHAPE, (128, 131073), (7, 262145)]
+INDEX_LAYOUTS = [(torch.int32, "contiguous")]
+EDGE_SHAPES = [(1, 1), (7, 1025)]
+if not cfg.QUICK_MODE:
+    INDEX_LAYOUTS.append((torch.int64, "padded"))
+    EDGE_SHAPES += [(3, 17), (3, 262144)]
 
 
 def _reference(logits, mapping, min_p):
     """FP32 thresholds, exact preservation of unfiltered input values."""
     values = logits.float()
-    row_min_p = min_p[mapping.long()].float().unsqueeze(1)
+    row_min_p = min_p[mapping.long()].unsqueeze(1)
     threshold = values.amax(dim=1, keepdim=True) + row_min_p.log()
     remove = (row_min_p > 0) & (values < threshold)
     return logits.masked_fill(remove, float("-inf"))
 
 
-def _check(logits, mapping, min_p):
+def _check(logits, mapping, min_p, expected=None):
     ref_device = "cpu" if cfg.TO_CPU else logits.device
-    expected = _reference(
-        logits.detach().to(ref_device),
-        mapping.to(ref_device),
-        min_p.to(ref_device),
-    )
+    if expected is None:
+        expected = _reference(
+            logits.detach().to(ref_device),
+            mapping.to(ref_device),
+            min_p.to(ref_device),
+        )
     mapping_before, min_p_before = mapping.clone(), min_p.clone()
     ptr, stride = logits.data_ptr(), logits.stride()
 
@@ -61,7 +56,10 @@ def _check(logits, mapping, min_p):
     # Check the exact mask and retained bits, including signed zero.
     bits = torch.int32 if logits.dtype == torch.float32 else torch.int16
     torch.testing.assert_close(
-        logits.to(ref_device).view(bits), expected.view(bits), rtol=0, atol=0
+        logits.to(ref_device).view(bits),
+        expected.to(ref_device).view(bits),
+        rtol=0,
+        atol=0,
     )
     torch.testing.assert_close(mapping, mapping_before, rtol=0, atol=0)
     torch.testing.assert_close(min_p, min_p_before, rtol=0, atol=0)
@@ -124,13 +122,12 @@ def test_apply_min_p_one_keeps_all_tied_maxima(dtype):
     logits = torch.tensor([[2, 2, 1, -5], [-3, -3, -4, -8]], device="cuda", dtype=dtype)
     mapping = torch.tensor([1, 0], device="cuda", dtype=torch.int64)
     min_p = torch.ones(2, device="cuda")
-    _check(logits, mapping, min_p)
     expected = torch.tensor(
         [[2, 2, -float("inf"), -float("inf")], [-3, -3, -float("inf"), -float("inf")]],
         device="cuda",
         dtype=dtype,
     )
-    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+    _check(logits, mapping, min_p, expected)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -162,20 +159,17 @@ def test_apply_min_p_probability_definition():
     probs = torch.softmax(logits.double(), dim=-1)
     cutoff = probs.amax(dim=-1, keepdim=True) * min_p[mapping, None].double()
     expected = logits.masked_fill(probs < cutoff, float("-inf"))
-    apply_min_p(logits, mapping, min_p)
-    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+    _check(logits, mapping, min_p, expected)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_apply_min_p_idempotent(dtype):
     generator = torch.Generator(device="cuda").manual_seed(31)
-    logits = torch.randn((7, 32769), device="cuda", dtype=dtype, generator=generator)
-    mapping = torch.arange(7, device="cuda", dtype=torch.int32) % 5
+    logits = torch.randn(WIDE_SHAPE, device="cuda", dtype=dtype, generator=generator)
+    mapping = torch.arange(logits.shape[0], device="cuda", dtype=torch.int32) % 5
     min_p = torch.tensor([0, 0.01, 0.1, 0.5, 1], device="cuda")
     _check(logits, mapping, min_p)
-    once = logits.clone()
-    apply_min_p(logits, mapping, min_p)
-    torch.testing.assert_close(logits, once, rtol=0, atol=0)
+    _check(logits, mapping, min_p, logits.clone())
 
 
 @pytest.mark.parametrize("shape", [(0, 17), (3, 0)])

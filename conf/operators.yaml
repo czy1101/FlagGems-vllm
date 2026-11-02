@@ -36,6 +36,19 @@ ops:
       - NeuralNetwork
     stages:
       - alpha: '5.4'
+  - id: apply_min_p
+    description: |
+      Filters logits in place using per-request min-p thresholds, retaining tokens
+      whose probabilities are at least min_p times the maximum token probability.
+    for:
+      - apply_min_p
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: apply_repetition_penalties
     description: |
       Modifies logit tensors in place to penalize tokens that have already appeared in the generated sequence.
@@ -382,9 +395,8 @@ ops:
       W8A8 variable-length FlashAttention-2 with FP16/BF16 output. Precisions:
       FP8 (block-wise FP8 Q/K/V with per-block descales; NVIDIA Hopper or newer
       and Moore Threads MUSA) and INT8 (INT8 Q/K/V with per-128-token descales;
-      Hygon DCU, PPU, MetaX, and Ascend).
+      Hygon DCU, PPU, and MetaX).
     for:
-      - flash_attn_varlen_func_w8a8
       - flash_attn_varlen_func_w8a8_int8
     labels:
       - NoCPU

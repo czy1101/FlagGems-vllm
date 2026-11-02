@@ -2,14 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """In-place min-p filtering with optional TLE shared-memory caching."""
 
-from functools import lru_cache
-
 import torch
 import triton
 import triton.language as tl
 
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+except ImportError:
+    gluon = None
+    gl = None
+
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+
+_HAS_GLUON_CLUSTER = gluon is not None and triton.__version__.split(".")[:2] == [
+    "3",
+    "6",
+]
 
 if has_triton_tle():
     import triton.experimental.tle.language as tle
@@ -26,9 +36,6 @@ _MAX_ROW_BLOCK = 32768
 _MIN_PARTIAL_TILE = 512
 _MAX_PARTIALS = 512
 _MAX_PARTITIONED_VOCAB = _MIN_PARTIAL_TILE * _MAX_PARTIALS
-# Keep only launch metadata; scratch and caller tensors remain per invocation.
-_MAX_PARTITIONED_PLANS = 128
-_PARTITIONED_LAUNCH_PLANS = {}
 # Match the cache candidates' byte budgets; amortize staging over useful data.
 _MIN_CACHED_ROW_BYTES = 131072
 _CACHE_BYTES_PER_SM = 196608
@@ -37,7 +44,6 @@ _STREAM_UTIL_NUM = 3
 _STREAM_UTIL_DEN = 4
 
 
-@lru_cache(maxsize=None)
 def _device_info(device_index):
     properties = torch.cuda.get_device_properties(device_index)
     return properties.major, properties.multi_processor_count
@@ -51,6 +57,8 @@ def _select_min_p_kernel(logits):
             return _min_p_row_kernel
         if vocab <= _MAX_PARTITIONED_VOCAB:
             if batch * 2 < sms:
+                if major == 9 and _HAS_GLUON_CLUSTER:
+                    return _min_p_cluster_kernel
                 return _partitioned_min_p
             row_bytes = vocab * logits.element_size()
             if (
@@ -481,41 +489,86 @@ def _min_p_mask_kernel(
         )
 
 
-# Match LibEntry's positional constexpr ABI; other versions keep normal entries.
-_PARTITIONED_FULL_ARGS_ABI = tuple(triton.__version__.split(".")[:2]) in (
-    ("3", "3"),
-    ("3", "4"),
-    ("3", "5"),
-    ("3", "6"),
-)
+def _prune_cluster_configs(configs, named_args, **kwargs):
+    block = triton.next_power_of_2({**named_args, **kwargs}["VOCAB_SIZE"])
+    vector_width = 16 // {**named_args, **kwargs}["logits_ptr"].element_size()
+    return [
+        _with_meta(config, CLUSTER_BLOCK=block, VECTOR_WIDTH=vector_width)
+        for config in configs
+    ]
 
 
-def _partitioned_launch_key(logits, mapping, min_p, partial, batch, vocab, stride):
-    partial_entry = _min_p_partial_kernel
-    mask_entry = _min_p_mask_kernel
-    if (
-        not _PARTITIONED_FULL_ARGS_ABI
-        or getattr(partial_entry, "_has_flagtune_tuner", True)
-        or getattr(mask_entry, "_has_flagtune_tuner", True)
-        or partial_entry.divisibility != mask_entry.divisibility
+if gluon is not None:
+
+    @libentry()
+    @libtuner(
+        configs=[
+            triton.Config(
+                {"CLUSTER_BLOCK": 0, "VECTOR_WIDTH": 0},
+                num_warps=warps,
+                num_ctas=8,
+                num_stages=1,
+                maxnreg=maxnreg,
+            )
+            for warps, maxnreg in ((8, 128), (16, 128), (32, 64))
+        ],
+        key=["N_ROWS", "VOCAB_SIZE"],
+        prune_configs_by={"early_config_prune": _prune_cluster_configs},
+        warmup=10,
+        rep=25,
+        use_cuda_graph=True,
+    )
+    @gluon.jit
+    def _min_p_cluster_kernel(
+        logits_ptr,
+        logits_stride,
+        mapping_ptr,
+        min_p_ptr,
+        N_ROWS: gl.constexpr,
+        VOCAB_SIZE: gl.constexpr,
+        CLUSTER_BLOCK: gl.constexpr,
+        VECTOR_WIDTH: gl.constexpr,
     ):
-        return None
-    alignment = partial_entry.divisibility
-    # Match LibEntry tensor specialization, including offset views and scratch.
-    pointers = tuple(
-        (value.dtype, value.data_ptr() % alignment == 0)
-        for value in (logits, mapping, min_p, partial)
-    )
-    return (
-        partial_entry,
-        mask_entry,
-        logits.device.index,
-        batch,
-        vocab,
-        stride,
-        alignment,
-        pointers,
-    )
+        row = gl.program_id(0).to(gl.int64)
+        request = gl.load(mapping_ptr + row)
+        min_p = gl.load(min_p_ptr + request).to(gl.float32)
+        if min_p != 0.0:
+            layout: gl.constexpr = gl.BlockedLayout(
+                [1, VECTOR_WIDTH],
+                [1, 32],
+                [1, gl.num_warps()],
+                [1, 0],
+                cga_layout=[[1, 0], [2, 0], [4, 0]],
+            )
+            replicated: gl.constexpr = gl.BlockedLayout(
+                [1],
+                [32],
+                [gl.num_warps()],
+                [0],
+                cga_layout=[[0], [0], [0]],
+            )
+            part = gl.arange(0, 8, layout=gl.SliceLayout(1, layout))[:, None]
+            lane = gl.arange(0, CLUSTER_BLOCK // 8, layout=gl.SliceLayout(0, layout))[
+                None, :
+            ]
+            columns = part * (CLUSTER_BLOCK // 8) + lane
+            values = gl.load(
+                logits_ptr + row * logits_stride + columns,
+                columns < VOCAB_SIZE,
+                other=-float("inf"),
+            )
+            partial = gl.max(values.to(gl.float32), 1)
+            shared_maxima = gl.convert_layout(partial, replicated)
+            maximum = gl.max(shared_maxima, 0)
+            threshold = maximum + gl.log(min_p)
+            filtered = gl.where(
+                values.to(gl.float32) < threshold, -float("inf"), values
+            )
+            gl.store(
+                logits_ptr + row * logits_stride + columns,
+                filtered,
+                columns < VOCAB_SIZE,
+            )
 
 
 def _partitioned_min_p(logits, mapping, min_p):
@@ -523,33 +576,11 @@ def _partitioned_min_p(logits, mapping, min_p):
     stride = logits.stride(0)
     capacity = triton.cdiv(vocab, _MIN_PARTIAL_TILE)
     partial = torch.empty((batch, capacity), device=logits.device, dtype=torch.float32)
-    key = _partitioned_launch_key(logits, mapping, min_p, partial, batch, vocab, stride)
-    plan = _PARTITIONED_LAUNCH_PLANS.get(key) if key is not None else None
-    if plan is not None:
-        partial_launch, mask_launch, part_block, parts, mask_block, partial_block = plan
-        partial_launch(
-            logits, stride, mapping, min_p, partial, capacity, batch, vocab, part_block
-        )
-        mask_launch(
-            logits,
-            stride,
-            mapping,
-            min_p,
-            partial,
-            capacity,
-            batch,
-            vocab,
-            parts,
-            mask_block,
-            partial_block,
-        )
-        return
-
-    partial_kernel, meta = _min_p_partial_kernel[
+    _, meta = _min_p_partial_kernel[
         lambda config: (batch, triton.cdiv(vocab, config["PART_BLOCK"]))
     ](logits, stride, mapping, min_p, partial, capacity, batch, vocab)
     parts = triton.cdiv(vocab, meta["PART_BLOCK"])
-    mask_kernel, mask_meta = _min_p_mask_kernel[
+    _min_p_mask_kernel[
         lambda config: (batch, triton.cdiv(vocab, config["MASK_BLOCK"]))
     ](
         logits,
@@ -562,55 +593,37 @@ def _partitioned_min_p(logits, mapping, min_p):
         vocab,
         parts,
     )
-    # Config pre-hooks belong to the normal entry path, not a bare launcher.
-    if key is not None and not any(
-        record[-1]
-        for entry in (_min_p_partial_kernel, _min_p_mask_kernel)
-        for record in entry.kernel_cache[logits.device.index].values()
-    ):
-        if len(_PARTITIONED_LAUNCH_PLANS) >= _MAX_PARTITIONED_PLANS:
-            _PARTITIONED_LAUNCH_PLANS.clear()
-        _PARTITIONED_LAUNCH_PLANS[key] = (
-            partial_kernel[(batch, parts, 1)],
-            mask_kernel[(batch, triton.cdiv(vocab, mask_meta["MASK_BLOCK"]), 1)],
-            meta["PART_BLOCK"],
-            parts,
-            mask_meta["MASK_BLOCK"],
-            mask_meta["PARTIAL_BLOCK"],
-        )
 
 
 def apply_min_p(
     logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, min_p: torch.Tensor
 ) -> None:
-    """Filter logits[B, V] in place using per-request FP32 min-p thresholds.
-
-    Columns must be contiguous and rows disjoint; row padding is supported.
-    Empty inputs are a no-op. Mapping indices must be valid and thresholds
-    must lie in [0, 1]. This operation is inference-only and returns None.
-    """
-    if logits.ndim != 2:
-        raise ValueError("min_p expects rank-2 logits")
+    """Filter logits in place; require valid mappings and FP32 min_p in [0, 1]."""
     num_tokens, vocab_size = logits.shape
     if num_tokens == 0 or vocab_size == 0:
         return
-    if logits.device.type != "cuda":
-        raise NotImplementedError("min_p requires CUDA logits")
-    if logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise NotImplementedError("min_p supports float16, bfloat16 and float32 logits")
-    if logits.stride(1) != 1 or (num_tokens > 1 and logits.stride(0) < vocab_size):
-        raise NotImplementedError("min_p requires contiguous columns and disjoint rows")
-    if expanded_idx_mapping.dtype not in (torch.int32, torch.int64):
-        raise NotImplementedError("min_p requires int32 or int64 request indices")
     if (
-        expanded_idx_mapping.ndim != 1
+        logits.device.type != "cuda"
+        or logits.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or logits.stride(1) != 1
+        or (num_tokens > 1 and logits.stride(0) < vocab_size)
+    ):
+        raise NotImplementedError(
+            "min_p requires CUDA FP16/BF16/FP32 logits with contiguous columns "
+            "and disjoint rows"
+        )
+    if (
+        expanded_idx_mapping.dtype not in (torch.int32, torch.int64)
+        or expanded_idx_mapping.ndim != 1
         or expanded_idx_mapping.shape[0] != num_tokens
         or expanded_idx_mapping.stride(0) != 1
         or min_p.ndim != 1
         or min_p.stride(0) != 1
         or min_p.dtype != torch.float32
     ):
-        raise NotImplementedError("min_p requires dense mapping[B] and FP32 thresholds")
+        raise NotImplementedError(
+            "min_p requires dense int32/int64 mapping[B] and dense FP32 thresholds"
+        )
     if expanded_idx_mapping.device != logits.device or min_p.device != logits.device:
         raise ValueError("min_p inputs must be on the same CUDA device")
     if logits.requires_grad or min_p.requires_grad:

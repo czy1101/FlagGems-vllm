@@ -1,30 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0 AND MIT
 # Copyright 2026 FlagOS Contributors
-"""Performance-only Triton latency benchmark for apply_min_p.
 
-    python -m pytest -s benchmark/test_apply_min_p.py --level core --warmup 100 --iter 300
-"""
-
-import functools
 import hashlib
 import inspect
 import json
 import math
 import statistics
 import time
-import warnings
 from pathlib import Path
 
 import pytest
 import torch
+from packaging.version import Version
 
-from flaggems_vllm.ops.apply_min_p import apply_min_p
+from flaggems_vllm.ops.min_p import apply_min_p
 
 from . import base
 from .conftest import Config, emit_record_logger, update_result
-from .consts import BenchMode
+from .consts import BenchMode, OperationAttribute
 
-# Cold-L2 preparation helpers follow TileOPs benchmarks/timing.py.
 # MIT License
 #
 # Copyright (c) Tile-AI.
@@ -48,54 +42,23 @@ from .consts import BenchMode
 # SOFTWARE
 
 
-@functools.lru_cache(maxsize=8)
-def _get_l2_flush_cache(device):
-    l2_bytes = getattr(torch.cuda.get_device_properties(device), "L2_cache_size", 0)
-    if l2_bytes <= 0:
-        warnings.warn("L2 size unavailable; using the upstream 512 MB flush buffer")
-        l2_bytes = int(256e6)
-    return torch.empty(2 * l2_bytes, dtype=torch.int8, device=device)
-
-
 def _measure_device_time(fn, reset, device, warmup_ms, repeat_ms, label):
-    """Measure current-stream elapsed time, including inter-kernel gaps.
-
-    Reset and cold-L2 preparation precede the start event on the same stream.
-    Warmup and sampling budgets use wall time, including preparation and
-    synchronization; each sampling phase collects at least five readings.
-    Compilation and lazy event initialization are outside both budgets.
-    """
-    if not math.isfinite(warmup_ms) or warmup_ms < 0:
-        raise ValueError("warmup_ms must be finite and >= 0")
-    if not math.isfinite(repeat_ms) or repeat_ms <= 0:
-        raise ValueError("repeat_ms must be finite and > 0")
     device = torch.device(device)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("Min-P CUDA Event timing requires a CUDA device")
 
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
-        cache = _get_l2_flush_cache(device)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record(stream)
         end.record(stream)
         end.synchronize()
 
-        def prepare():
-            reset()
-            cache.zero_()
-
-        # Compile/autotune and finish first allocations before collecting samples.
-        prepare()
-        _ = fn()
-        stream.synchronize()
-        del _
-
         warmup_start = time.perf_counter()
         warmup_count = 0
         while (time.perf_counter() - warmup_start) * 1000 < warmup_ms:
-            prepare()
+            reset()
             _ = fn()
             stream.synchronize()
             del _
@@ -107,13 +70,12 @@ def _measure_device_time(fn, reset, device, warmup_ms, repeat_ms, label):
         while (
             len(samples) < 5 or (time.perf_counter() - sample_start) * 1000 < repeat_ms
         ):
-            prepare()
+            reset()
             start.record(stream)
             _ = fn()
             end.record(stream)
             end.synchronize()
             samples.append({"latency_ms": start.elapsed_time(end)})
-            # Keep any returned result alive until the GPU is finished.
             del _
         sample_wall_ms = (time.perf_counter() - sample_start) * 1000
 
@@ -121,7 +83,7 @@ def _measure_device_time(fn, reset, device, warmup_ms, repeat_ms, label):
         "timing": "cuda-event",
         "device_metric": "complete-call current-stream elapsed time",
         "includes_inter_kernel_gaps": True,
-        "preparation": "input reset and cold-L2 flush before the start event",
+        "preparation": "input reset before the start event; no explicit L2 flush",
         "budget_basis": "wall time including preparation and synchronization",
         "warmup_ms": warmup_ms,
         "sample_ms": repeat_ms,
@@ -136,21 +98,13 @@ def _measure_device_time(fn, reset, device, warmup_ms, repeat_ms, label):
 class ApplyMinPBenchmark(base.Benchmark):
     DEFAULT_METRICS = ["latency"]
     DEFAULT_SHAPE_DESC = "batch, vocab, dtype"
-    DEFAULT_SHAPES = [
-        (1, 128256, "bfloat16"),
-        (1, 128256, "float32"),
-        (64, 128256, "bfloat16"),
-        (256, 128256, "float16"),
-        (256, 128256, "bfloat16"),
-        (128, 151936, "bfloat16"),
-        (17, 129280, "bfloat16"),
-        (100, 32000, "float16"),
-    ]
+    DEFAULT_SHAPES = ()
     CASE_DTYPES = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }
+    DEFAULT_DTYPES = list(CASE_DTYPES.values())
 
     def get_input_iter(self, dtype):
         generator = torch.Generator(device=self.device).manual_seed(2026)
@@ -181,87 +135,136 @@ class ApplyMinPBenchmark(base.Benchmark):
             "inputs": super().record_shapes(*args, **kwargs),
         }
 
+    def run(self):
+        self.init_user_config()
+        if not self.shapes:
+            raise ValueError("No apply_min_p shapes configured in --shape_file")
+        if Config.query:
+            attributes = OperationAttribute(self.op_name, self.shapes, self.shape_desc)
+            print(attributes)
+            emit_record_logger(attributes.to_dict())
+            return
+        if Config.mode != BenchMode.KERNEL:
+            raise ValueError("The CUDA Event comparison requires --mode kernel")
 
-def _run_benchmark(bench):
-    if Config.query:
-        return bench.run()
-    if Config.mode != BenchMode.KERNEL:
-        raise ValueError("The CUDA Event latency benchmark requires --mode kernel")
+        if not math.isfinite(Config.warm_up) or Config.warm_up < 0:
+            raise ValueError("--warmup must be finite and >= 0 (milliseconds)")
+        if not math.isfinite(Config.repetition) or Config.repetition <= 0:
+            raise ValueError("--iter must be finite and > 0 (milliseconds)")
+        import tilelang
+        from tileops._kernels.sampling.min_p_mask import MinPMaskFwdKernel
+        from tileops.backend import BUILTIN
+        from tileops.sampling import MinPMaskFwdOp
 
-    bench.init_user_config()
-    triton_path = Path(inspect.getfile(bench.gems_op))
-    source = {
-        "triton_path": str(triton_path),
-        "triton_sha256": hashlib.sha256(triton_path.read_bytes()).hexdigest(),
-        "torch_version": torch.__version__,
-        "device": torch.cuda.get_device_name(),
-    }
-    protocol = {
-        "timer": "cuda-event",
-        "metric": "latency_ms",
-        "measurement": "complete-call current-stream elapsed time, including kernel gaps",
-        "warmup_ms": Config.warm_up,
-        "sample_ms": Config.repetition,
-        "minimum_samples": 5,
-        "budget_basis": "wall time including preparation and synchronization",
-        "l2": "flush before every invocation, after input reset",
-        "input_reset": "private input restored outside every timed invocation",
-        "min_p": 0.1,
-        "seed": 2026,
-        "api": "in-place, identity request mapping",
-    }
-    print("Implementation: Triton; timer: CUDA Event")
-    print(json.dumps(source))
-    for dtype in bench.to_bench_dtypes:
-        rows = []
-        print(f"\napply_min_p dtype={dtype}; times in ms")
-        print(f"{'Batch':>8} {'Vocab':>10} {'Triton Latency':>16}")
-        for logits, mapping, min_p in bench.get_input_iter(dtype):
-            batch, vocab = logits.shape
-            working_logits = torch.empty_like(logits)
-            samples, metadata = _measure_device_time(
-                lambda: bench.gems_op(working_logits, mapping, min_p),
-                reset=lambda: working_logits.copy_(logits),
-                device=logits.device,
-                warmup_ms=Config.warm_up,
-                repeat_ms=Config.repetition,
-                label="triton",
-            )
-            latency_ms = statistics.median(sample["latency_ms"] for sample in samples)
-            rows.append(
-                {
-                    "shape_detail": bench.record_shapes(logits, mapping, min_p),
-                    "latency": latency_ms,
-                    "samples": samples,
-                    "timing_metadata": metadata,
-                }
-            )
-            print(f"{batch:>8} {vocab:>10} {latency_ms:>16.6f}", flush=True)
-        result = {
-            "op_name": bench.op_name,
-            "dtype": str(dtype),
-            "level": Config.bench_level.value,
-            "mode": Config.mode.value,
-            "implementation": "triton",
-            "timer": "cuda-event",
-            "source": source,
-            "protocol": protocol,
-            "result": rows,
+        if Version(tilelang.__version__) < Version("0.1.12"):
+            raise RuntimeError("TileLang >= 0.1.12 required")
+        tileops_op = MinPMaskFwdOp(target=BUILTIN)
+        source = {
+            "tilelang_version": tilelang.__version__,
+            "torch_version": torch.__version__,
+            "device": torch.cuda.get_device_name(),
         }
-        update_result(bench.op_name, result)
-        emit_record_logger(json.dumps(result))
+        for name, implementation in (
+            ("tileops", MinPMaskFwdOp),
+            ("tileops_kernel", MinPMaskFwdKernel),
+            ("triton", self.gems_op),
+        ):
+            path = Path(inspect.getfile(implementation))
+            source[f"{name}_path"] = str(path)
+            source[f"{name}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        protocol = {
+            "timer": "cuda-event",
+            "metric": "latency_ms",
+            "measurement": "complete-call current-stream elapsed time, including kernel gaps",
+            "phase_order": ["tileops", "triton", "triton", "tileops"],
+            "warmup_ms_per_implementation": Config.warm_up,
+            "sample_ms_per_implementation": Config.repetition,
+            "minimum_samples_per_phase": 5,
+            "budget_basis": "wall time including preparation and synchronization",
+            "l2": "no explicit flush; cache state follows input reset and prior work",
+            "input_reset": "private input restored outside every timed invocation",
+            "min_p": 0.1,
+            "seed": 2026,
+            "tileops_api": "out-of-place, native output/scratch allocation",
+            "triton_api": "in-place, identity request mapping",
+            "speedup": "TileOPs median / Triton median",
+        }
+        print("Baseline: native TileOPs/TileLang API; timer: CUDA Event")
+        print(json.dumps(source))
+        for dtype in self.to_bench_dtypes:
+            rows = []
+            print(f"\napply_min_p dtype={dtype}; times in ms; speedup=TileOPs/Triton")
+            print(
+                f"{'Batch':>8} {'Vocab':>10} {'TileOPs':>12} {'Triton':>12} {'Speedup':>10}"
+            )
+            for logits, mapping, min_p in self.get_input_iter(dtype):
+                batch, vocab = logits.shape
+                tileops_logits = torch.empty_like(logits)
+                triton_logits = torch.empty_like(logits)
+                calls = {
+                    "tileops": lambda: tileops_op(tileops_logits, min_p),
+                    "triton": lambda: self.gems_op(triton_logits, mapping, min_p),
+                }
+                resets = {
+                    "tileops": lambda: tileops_logits.copy_(logits),
+                    "triton": lambda: triton_logits.copy_(logits),
+                }
+                for tag in calls:
+                    resets[tag]()
+                    result = calls[tag]()
+                    torch.cuda.current_stream(logits.device).synchronize()
+                    del result
+                samples = {"tileops": [], "triton": []}
+                phases = []
+                for phase_index, tag in enumerate(protocol["phase_order"]):
+                    measured, metadata = _measure_device_time(
+                        calls[tag],
+                        reset=resets[tag],
+                        device=logits.device,
+                        warmup_ms=Config.warm_up / 2,
+                        repeat_ms=Config.repetition / 2,
+                        label=f"{phase_index}-{tag}",
+                    )
+                    samples[tag].extend(measured)
+                    phases.append({"implementation": tag, "metadata": metadata})
+                tileops_ms = statistics.median(
+                    sample["latency_ms"] for sample in samples["tileops"]
+                )
+                triton_ms = statistics.median(
+                    sample["latency_ms"] for sample in samples["triton"]
+                )
+                speedup = tileops_ms / triton_ms
+                rows.append(
+                    {
+                        "shape_detail": self.record_shapes(logits, mapping, min_p),
+                        "latency_base": tileops_ms,
+                        "latency": triton_ms,
+                        "speedup": speedup,
+                        "samples": samples,
+                        "phases": phases,
+                    }
+                )
+                print(
+                    f"{batch:>8} {vocab:>10} {tileops_ms:>12.6f} {triton_ms:>12.6f} {speedup:>9.3f}x",
+                    flush=True,
+                )
+            result = {
+                "op_name": self.op_name,
+                "dtype": str(dtype),
+                "level": Config.bench_level.value,
+                "mode": Config.mode.value,
+                "baseline": "tileops-tilelang",
+                "implementation": "triton",
+                "timer": "cuda-event",
+                "source": source,
+                "protocol": protocol,
+                "result": rows,
+            }
+            update_result(self.op_name, result)
+            emit_record_logger(json.dumps(result))
 
 
-@pytest.mark.apply_min_p
+@pytest.mark.apply_min_p(shape_desc=ApplyMinPBenchmark.DEFAULT_SHAPE_DESC)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_apply_min_p():
-    if Config.warm_up < 0 or Config.repetition <= 0:
-        raise ValueError("--warmup must be >= 0 and --iter must be > 0 (milliseconds)")
-    print(f"apply_min_p device: {torch.cuda.get_device_name()}")
-    bench = ApplyMinPBenchmark(
-        op_name="apply_min_p",
-        torch_op=None,
-        gems_op=apply_min_p,
-        dtypes=[torch.float16, torch.bfloat16, torch.float32],
-    )
-    _run_benchmark(bench)
+    ApplyMinPBenchmark(op_name="apply_min_p", torch_op=None, gems_op=apply_min_p).run()

@@ -85,12 +85,6 @@ from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
-from flaggems_vllm.ops.ihc import (
-    ihc_post,
-    ihc_post_ref,
-    ihc_pre,
-    ihc_pre_ref,
-)
 from flaggems_vllm.ops.mhc import (
     MixLayout,
     hc_head_fused_kernel,
@@ -101,6 +95,7 @@ from flaggems_vllm.ops.mhc import (
     mhc_pre,
     sinkhorn_forward,
 )
+from flaggems_vllm.ops.min_p import apply_min_p
 from flaggems_vllm.ops.qwen4 import (
     ple_short_conv_,
     ple_gate_norm,
@@ -125,7 +120,6 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_compress_qsa_groups,
     qwen4_vendor_qsa_mqa_paged,
     qwen4_vendor_store_qsa_rows,
-    qsa_prepare,
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
@@ -227,6 +221,7 @@ from flaggems_vllm.ops.vit_attention import (
 __all__ = [
     "act_quant_triton",
     "add_rms_norm",
+    "apply_min_p",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
     "attn_res",
@@ -289,10 +284,6 @@ __all__ = [
     "hadamard128",
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
-    "ihc_post",
-    "ihc_post_ref",
-    "ihc_pre",
-    "ihc_pre_ref",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "instance_norm",
@@ -335,7 +326,6 @@ __all__ = [
     "qsa_compress_groups_with_ratio",
     "qsa_compress_norm_mrope_store_groups",
     "qsa_mqa_paged",
-    "qsa_prepare",
     "qsa_sparse_paged_attention",
     "qsa_sparse_split_count",
     "qsa_store_cache_rows",
@@ -435,12 +425,3 @@ if _runtime.device.vendor_name == "metax":
     )
 
     __all__.append("flash_attn_varlen_func_w8a8_int8")
-
-if _runtime.device.vendor_name == "ascend":
-    from flaggems_vllm.runtime.backend._ascend.fused import (
-        attention as ascend_attention,
-    )
-
-    flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
-    flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
-    __all__.append("flash_attn_varlen_func_w8a8")
