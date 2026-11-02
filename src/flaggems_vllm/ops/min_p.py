@@ -31,8 +31,7 @@ else:
     tle = None
     _HAS_TLE_CACHE = False
 
-# Bound the full-row SSA footprint before selecting a wider-row path.
-_MAX_ROW_BLOCK = 32768
+_MIN_WIDE_VOCAB = 32768
 _MIN_PARTIAL_TILE = 512
 _MAX_PARTIALS = 512
 _MAX_PARTITIONED_VOCAB = _MIN_PARTIAL_TILE * _MAX_PARTIALS
@@ -52,21 +51,18 @@ def _device_info(device_index):
 def _select_min_p_kernel(logits):
     batch, vocab = logits.shape
     major, sms = _device_info(logits.device.index)
-    if major >= 9:
-        if vocab <= _MAX_ROW_BLOCK:
-            return _min_p_row_kernel
-        if vocab <= _MAX_PARTITIONED_VOCAB:
-            if batch * 2 < sms:
-                if major == 9 and _HAS_GLUON_CLUSTER:
-                    return _min_p_cluster_kernel
-                return _partitioned_min_p
-            row_bytes = vocab * logits.element_size()
-            if (
-                _HAS_TLE_CACHE
-                and row_bytes >= _MIN_CACHED_ROW_BYTES
-                and batch * row_bytes >= sms * _CACHE_BYTES_PER_SM
-            ):
-                return _min_p_cached_word_kernel
+    if major >= 9 and _MIN_WIDE_VOCAB < vocab <= _MAX_PARTITIONED_VOCAB:
+        if batch * 2 < sms:
+            if major == 9 and _HAS_GLUON_CLUSTER:
+                return _min_p_cluster_kernel
+            return _partitioned_min_p
+        row_bytes = vocab * logits.element_size()
+        if (
+            _HAS_TLE_CACHE
+            and row_bytes >= _MIN_CACHED_ROW_BYTES
+            and batch * row_bytes >= sms * _CACHE_BYTES_PER_SM
+        ):
+            return _min_p_cached_word_kernel
     return _min_p_general_kernel
 
 
@@ -262,61 +258,6 @@ def _min_p_cached_word_kernel(
         _min_p_store_filtered(
             row_ptr + held_columns, held, threshold, held_columns < VOCAB_SIZE
         )
-
-
-def _prune_row_configs(configs, named_args, **kwargs):
-    block = triton.next_power_of_2({**named_args, **kwargs}["VOCAB_SIZE"])
-    # Bound per-thread arrays while preserving each candidate's register cap.
-    return [
-        _with_meta(config, ROW_BLOCK=block)
-        for config in configs
-        if block <= 512 * 32 * config.num_warps
-    ]
-
-
-@libentry()
-@libtuner(
-    configs=[
-        triton.Config(
-            {"ROW_BLOCK": 0},
-            num_warps=warps,
-            num_ctas=1,
-            num_stages=1,
-            maxnreg=maxnreg,
-        )
-        for warps, maxnreg in ((4, 128), (8, 128), (16, 128), (32, 64))
-    ],
-    key=["N_ROWS", "VOCAB_SIZE"],
-    prune_configs_by={"early_config_prune": _prune_row_configs},
-    warmup=10,
-    rep=25,
-    use_cuda_graph=True,
-)
-@triton.jit
-def _min_p_row_kernel(
-    logits_ptr,
-    logits_stride,
-    expanded_idx_mapping_ptr,
-    min_p_ptr,
-    N_ROWS: tl.constexpr,
-    VOCAB_SIZE: tl.constexpr,
-    ROW_BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    row_ptr = logits_ptr + row * logits_stride
-    request = tl.load(expanded_idx_mapping_ptr + row)
-    min_p = tl.load(min_p_ptr + request).to(tl.float32)
-    if min_p != 0.0:
-        columns = tl.arange(0, ROW_BLOCK)[None, :]
-        valid = columns < VOCAB_SIZE
-        values = tl.load(
-            row_ptr + columns,
-            mask=valid,
-            other=float("-inf"),
-        )
-        maximum = tl.max(values, 1).to(tl.float32)
-        threshold = maximum + tl.log(min_p)
-        _min_p_store_filtered(row_ptr + columns, values, threshold[:, None], valid)
 
 
 def _prune_stream_configs(configs, named_args, **kwargs):

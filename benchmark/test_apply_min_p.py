@@ -4,14 +4,12 @@
 import hashlib
 import inspect
 import json
-import math
 import statistics
 import time
 from pathlib import Path
 
 import pytest
 import torch
-from packaging.version import Version
 
 from flaggems_vllm.ops.min_p import apply_min_p
 
@@ -44,9 +42,6 @@ from .consts import BenchMode, OperationAttribute
 
 def _measure_device_time(fn, reset, device, warmup_ms, repeat_ms, label):
     device = torch.device(device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("Min-P CUDA Event timing requires a CUDA device")
-
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
         start = torch.cuda.Event(enable_timing=True)
@@ -108,14 +103,7 @@ class ApplyMinPBenchmark(base.Benchmark):
 
     def get_input_iter(self, dtype):
         generator = torch.Generator(device=self.device).manual_seed(2026)
-        for shape in self.shapes:
-            if len(shape) != 3:
-                raise ValueError("Expected apply_min_p shape (batch, vocab, dtype)")
-            tokens, vocab, case_dtype = shape
-            if tokens <= 0 or vocab <= 0 or case_dtype not in self.CASE_DTYPES:
-                raise ValueError(
-                    "Expected positive batch/vocab and dtype float16/bfloat16/float32"
-                )
+        for tokens, vocab, case_dtype in self.shapes:
             if dtype != self.CASE_DTYPES[case_dtype]:
                 continue
             logits = torch.randn(
@@ -137,27 +125,16 @@ class ApplyMinPBenchmark(base.Benchmark):
 
     def run(self):
         self.init_user_config()
-        if not self.shapes:
-            raise ValueError("No apply_min_p shapes configured in --shape_file")
         if Config.query:
             attributes = OperationAttribute(self.op_name, self.shapes, self.shape_desc)
             print(attributes)
             emit_record_logger(attributes.to_dict())
             return
-        if Config.mode != BenchMode.KERNEL:
-            raise ValueError("The CUDA Event comparison requires --mode kernel")
-
-        if not math.isfinite(Config.warm_up) or Config.warm_up < 0:
-            raise ValueError("--warmup must be finite and >= 0 (milliseconds)")
-        if not math.isfinite(Config.repetition) or Config.repetition <= 0:
-            raise ValueError("--iter must be finite and > 0 (milliseconds)")
         import tilelang
         from tileops._kernels.sampling.min_p_mask import MinPMaskFwdKernel
         from tileops.backend import BUILTIN
         from tileops.sampling import MinPMaskFwdOp
 
-        if Version(tilelang.__version__) < Version("0.1.12"):
-            raise RuntimeError("TileLang >= 0.1.12 required")
         tileops_op = MinPMaskFwdOp(target=BUILTIN)
         source = {
             "tilelang_version": tilelang.__version__,
@@ -252,7 +229,7 @@ class ApplyMinPBenchmark(base.Benchmark):
                 "op_name": self.op_name,
                 "dtype": str(dtype),
                 "level": Config.bench_level.value,
-                "mode": Config.mode.value,
+                "mode": BenchMode.KERNEL.value,
                 "baseline": "tileops-tilelang",
                 "implementation": "triton",
                 "timer": "cuda-event",
