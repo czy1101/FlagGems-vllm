@@ -602,33 +602,6 @@ def apply_min_p(
     num_tokens, vocab_size = logits.shape
     if num_tokens == 0 or vocab_size == 0:
         return
-    if (
-        logits.device.type != "cuda"
-        or logits.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-        or logits.stride(1) != 1
-        or (num_tokens > 1 and logits.stride(0) < vocab_size)
-    ):
-        raise NotImplementedError(
-            "min_p requires CUDA FP16/BF16/FP32 logits with contiguous columns "
-            "and disjoint rows"
-        )
-    if (
-        expanded_idx_mapping.dtype not in (torch.int32, torch.int64)
-        or expanded_idx_mapping.ndim != 1
-        or expanded_idx_mapping.shape[0] != num_tokens
-        or expanded_idx_mapping.stride(0) != 1
-        or min_p.ndim != 1
-        or min_p.stride(0) != 1
-        or min_p.dtype != torch.float32
-    ):
-        raise NotImplementedError(
-            "min_p requires dense int32/int64 mapping[B] and dense FP32 thresholds"
-        )
-    if expanded_idx_mapping.device != logits.device or min_p.device != logits.device:
-        raise ValueError("min_p inputs must be on the same CUDA device")
-    if logits.requires_grad or min_p.requires_grad:
-        raise NotImplementedError("min_p is an inference-only in-place operation")
-
     kernel = _select_min_p_kernel(logits)
     if kernel is _partitioned_min_p:
         kernel(logits, expanded_idx_mapping, min_p)
