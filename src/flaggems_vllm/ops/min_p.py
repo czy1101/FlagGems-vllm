@@ -32,9 +32,7 @@ _TLE_CLUSTER_MESH = (
 )
 
 _MIN_WIDE_VOCAB = 32768
-_MIN_PARTIAL_TILE = 512
-_MAX_PARTIALS = 512
-_MAX_PARTITIONED_VOCAB = _MIN_PARTIAL_TILE * _MAX_PARTIALS
+_MAX_WIDE_VOCAB = 262144
 # Match the cache candidates' byte budgets; amortize staging over useful data.
 _MIN_CACHED_ROW_BYTES = 131072
 _CACHE_BYTES_PER_SM = 196608
@@ -43,23 +41,22 @@ _STREAM_UTIL_NUM = 3
 _STREAM_UTIL_DEN = 4
 
 
-def _device_info(device_index):
+def _device_sm_count(device_index):
     properties = torch.cuda.get_device_properties(device_index)
-    return properties.major, properties.multi_processor_count
+    return properties.multi_processor_count
 
 
 def _select_min_p_kernel(logits):
     batch, vocab = logits.shape
-    major, sms = _device_info(logits.device.index)
-    if major >= 9 and _MIN_WIDE_VOCAB < vocab <= _MAX_PARTITIONED_VOCAB:
+    sms = _device_sm_count(logits.device.index)
+    if _MIN_WIDE_VOCAB < vocab <= _MAX_WIDE_VOCAB:
         if batch * 2 < sms:
             if (
-                major == 9
-                and _HAS_TLE_CLUSTER
+                _HAS_TLE_CLUSTER
                 and vocab <= _TLE_CLUSTER_SIZE * _MAX_TLE_CLUSTER_BLOCK
             ):
                 return _min_p_tle_cluster_kernel
-            return _partitioned_min_p
+            return _min_p_general_kernel
         row_bytes = vocab * logits.element_size()
         if (
             _HAS_TLE_CACHE
@@ -330,110 +327,6 @@ def _min_p_general_kernel(
             )
 
 
-@libentry()
-@libtuner(
-    configs=[
-        triton.Config({"PART_BLOCK": block}, num_warps=warps, num_stages=1)
-        for block, warps in ((512, 4), (1024, 4), (2048, 4), (4096, 4), (8192, 8))
-    ],
-    key=["N_ROWS", "vocab_size"],
-    warmup=10,
-    rep=25,
-    use_cuda_graph=True,
-)
-@triton.jit
-def _min_p_partial_kernel(
-    logits_ptr,
-    logits_stride,
-    mapping_ptr,
-    min_p_ptr,
-    partial_ptr,
-    partial_stride,
-    N_ROWS,
-    vocab_size,
-    PART_BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    row_ptr = logits_ptr + row * logits_stride
-    part = tl.program_id(1)
-    request = tl.load(mapping_ptr + row)
-    min_p = tl.load(min_p_ptr + request)
-    if min_p != 0.0:
-        columns = part.to(tl.int64) * PART_BLOCK + tl.arange(0, PART_BLOCK)
-        values = tl.load(
-            row_ptr + columns,
-            mask=columns < vocab_size,
-            other=float("-inf"),
-        ).to(tl.float32)
-        maximum = tl.max(values, 0)
-        tl.store(partial_ptr + row * partial_stride + part, maximum)
-
-
-def _prune_mask_configs(configs, named_args, **kwargs):
-    partial_block = triton.next_power_of_2({**named_args, **kwargs}["N_PARTS"])
-    return [_with_meta(config, PARTIAL_BLOCK=partial_block) for config in configs]
-
-
-@libentry()
-@libtuner(
-    configs=[
-        triton.Config(
-            {"MASK_BLOCK": block, "PARTIAL_BLOCK": 0}, num_warps=warps, num_stages=1
-        )
-        for block, warps in (
-            (512, 4),
-            (1024, 1),
-            (1024, 4),
-            (2048, 4),
-            (4096, 4),
-            (4096, 8),
-        )
-    ],
-    key=["N_ROWS", "vocab_size", "N_PARTS"],
-    prune_configs_by={"early_config_prune": _prune_mask_configs},
-    warmup=10,
-    rep=25,
-    use_cuda_graph=True,
-)
-@triton.jit
-def _min_p_mask_kernel(
-    logits_ptr,
-    logits_stride,
-    mapping_ptr,
-    min_p_ptr,
-    partial_ptr,
-    partial_stride,
-    N_ROWS,
-    vocab_size,
-    N_PARTS: tl.constexpr,
-    MASK_BLOCK: tl.constexpr,
-    PARTIAL_BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    row_ptr = logits_ptr + row * logits_stride
-    tile = tl.program_id(1).to(tl.int64)
-    request = tl.load(mapping_ptr + row)
-    min_p = tl.load(min_p_ptr + request).to(tl.float32)
-    if min_p != 0.0:
-        parts = tl.arange(0, PARTIAL_BLOCK)
-        maxima = tl.load(
-            partial_ptr + row * partial_stride + parts,
-            mask=parts < N_PARTS,
-            other=float("-inf"),
-        )
-        maximum = tl.max(maxima, 0)
-        threshold = maximum + tl.log(min_p)
-        columns = tile * MASK_BLOCK + tl.arange(0, MASK_BLOCK)
-        values = tl.load(
-            row_ptr + columns,
-            mask=columns < vocab_size,
-            other=float("-inf"),
-        )
-        _min_p_store_filtered(
-            row_ptr + columns, values, threshold, columns < vocab_size
-        )
-
-
 def _prune_tle_cluster_configs(configs, named_args, **kwargs):
     block = (
         triton.next_power_of_2({**named_args, **kwargs}["VOCAB_SIZE"])
@@ -511,30 +404,6 @@ if _HAS_TLE_CLUSTER:
             )
 
 
-def _partitioned_min_p(logits, mapping, min_p):
-    batch, vocab = logits.shape
-    stride = logits.stride(0)
-    capacity = triton.cdiv(vocab, _MIN_PARTIAL_TILE)
-    partial = torch.empty((batch, capacity), device=logits.device, dtype=torch.float32)
-    _, meta = _min_p_partial_kernel[
-        lambda config: (batch, triton.cdiv(vocab, config["PART_BLOCK"]))
-    ](logits, stride, mapping, min_p, partial, capacity, batch, vocab)
-    parts = triton.cdiv(vocab, meta["PART_BLOCK"])
-    _min_p_mask_kernel[
-        lambda config: (batch, triton.cdiv(vocab, config["MASK_BLOCK"]))
-    ](
-        logits,
-        stride,
-        mapping,
-        min_p,
-        partial,
-        capacity,
-        batch,
-        vocab,
-        parts,
-    )
-
-
 def apply_min_p(
     logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, min_p: torch.Tensor
 ) -> None:
@@ -543,9 +412,6 @@ def apply_min_p(
     if num_tokens == 0 or vocab_size == 0:
         return
     kernel = _select_min_p_kernel(logits)
-    if kernel is _partitioned_min_p:
-        kernel(logits, expanded_idx_mapping, min_p)
-        return
     if _HAS_TLE_CLUSTER and kernel is _min_p_tle_cluster_kernel:
         kernel[(num_tokens,)](
             logits,
