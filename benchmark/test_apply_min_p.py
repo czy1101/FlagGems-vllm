@@ -1,22 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 AND MIT
 # Copyright 2026 FlagOS Contributors
 
-import hashlib
-import inspect
-import json
-import statistics
-import time
-from pathlib import Path
-
-import pytest
-import torch
-
-from flaggems_vllm.ops.min_p import apply_min_p
-
-from . import base
-from .conftest import Config, emit_record_logger, update_result
-from .consts import BenchMode, OperationAttribute
-
+# Timing helpers adapted from TileOPs benchmarks/timing.py.
 # MIT License
 #
 # Copyright (c) Tile-AI.
@@ -38,6 +23,35 @@ from .consts import BenchMode, OperationAttribute
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE
+
+import hashlib
+import inspect
+import json
+import statistics
+import time
+from pathlib import Path
+
+import pytest
+import torch
+
+from flaggems_vllm.ops.min_p import apply_min_p
+
+from . import base
+from .conftest import Config, emit_record_logger, update_result
+from .consts import BenchMode, OperationAttribute
+
+_TILEOPS_UNAVAILABLE_REASON = None
+try:
+    import tilelang
+    from tileops._kernels.sampling.min_p_mask import MinPMaskFwdKernel
+    from tileops.backend import BUILTIN
+    from tileops.sampling import MinPMaskFwdOp
+except ModuleNotFoundError as exc:
+    if exc.name not in ("tileops", "tilelang"):
+        raise
+    _TILEOPS_UNAVAILABLE_REASON = (
+        f"TileOPs/TileLang baseline dependency is not installed: {exc.name}"
+    )
 
 
 def _measure_device_time(fn, reset, device, warmup_ms, repeat_ms, label):
@@ -130,11 +144,8 @@ class ApplyMinPBenchmark(base.Benchmark):
             print(attributes)
             emit_record_logger(attributes.to_dict())
             return
-        import tilelang
-        from tileops._kernels.sampling.min_p_mask import MinPMaskFwdKernel
-        from tileops.backend import BUILTIN
-        from tileops.sampling import MinPMaskFwdOp
-
+        if _TILEOPS_UNAVAILABLE_REASON is not None:
+            pytest.skip(_TILEOPS_UNAVAILABLE_REASON)
         tileops_op = MinPMaskFwdOp(target=BUILTIN)
         source = {
             "tilelang_version": tilelang.__version__,

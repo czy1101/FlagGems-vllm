@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""In-place min-p filtering with optional TLE shared-memory caching."""
+"""In-place min-p filtering with streaming and optional TLE cluster reduction."""
 
 import torch
 import triton
@@ -12,16 +12,16 @@ from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 if has_triton_tle():
     import triton.experimental.tle.language as tle
 
-    _HAS_TLE_CACHE = all(
+    _HAS_TLE_SHARED = all(
         callable(getattr(tle.gpu, name, None)) for name in ("alloc", "local_ptr")
     )
 else:
     tle = None
-    _HAS_TLE_CACHE = False
+    _HAS_TLE_SHARED = False
 
 _TLE_CLUSTER_SIZE = 8
 _MAX_TLE_CLUSTER_BLOCK = 16384
-_HAS_TLE_CLUSTER = _HAS_TLE_CACHE and all(
+_HAS_TLE_CLUSTER = _HAS_TLE_SHARED and all(
     callable(getattr(tle, name, None))
     for name in ("device_mesh", "shard_id", "remote", "distributed_barrier")
 )
@@ -32,10 +32,6 @@ _TLE_CLUSTER_MESH = (
 )
 
 _MIN_WIDE_VOCAB = 32768
-_MAX_WIDE_VOCAB = 262144
-# Match the cache candidates' byte budgets; amortize staging over useful data.
-_MIN_CACHED_ROW_BYTES = 131072
-_CACHE_BYTES_PER_SM = 196608
 # Prune wasteful tails, but always keep a general candidate for tiny rows.
 _STREAM_UTIL_NUM = 3
 _STREAM_UTIL_DEN = 4
@@ -49,21 +45,20 @@ def _device_sm_count(device_index):
 def _select_min_p_kernel(logits):
     batch, vocab = logits.shape
     sms = _device_sm_count(logits.device.index)
-    if _MIN_WIDE_VOCAB < vocab <= _MAX_WIDE_VOCAB:
-        if batch * 2 < sms:
-            if (
-                _HAS_TLE_CLUSTER
-                and vocab <= _TLE_CLUSTER_SIZE * _MAX_TLE_CLUSTER_BLOCK
-            ):
-                return _min_p_tle_cluster_kernel
-            return _min_p_general_kernel
-        row_bytes = vocab * logits.element_size()
-        if (
-            _HAS_TLE_CACHE
-            and row_bytes >= _MIN_CACHED_ROW_BYTES
-            and batch * row_bytes >= sms * _CACHE_BYTES_PER_SM
-        ):
-            return _min_p_cached_word_kernel
+    if (
+        _HAS_TLE_CLUSTER
+        and _MIN_WIDE_VOCAB < vocab <= _TLE_CLUSTER_SIZE * _MAX_TLE_CLUSTER_BLOCK
+        and batch * 2 < sms
+    ):
+        return _min_p_tle_cluster_kernel
+    if (
+        _HAS_TLE_CLUSTER
+        and _MIN_WIDE_VOCAB < vocab <= _TLE_CLUSTER_SIZE * _MAX_TLE_CLUSTER_BLOCK
+        and _STREAM_UTIL_DEN * vocab
+        >= _STREAM_UTIL_NUM * (1 << (vocab - 1).bit_length())
+    ):
+        # Reuse actual input shards when padding waste is small.
+        return _min_p_tle_staged_cluster_kernel
     return _min_p_general_kernel
 
 
@@ -74,7 +69,6 @@ def _with_meta(config, **meta):
         num_warps=config.num_warps,
         num_ctas=config.num_ctas,
         num_stages=config.num_stages,
-        maxnreg=config.maxnreg,
     )
 
 
@@ -85,180 +79,6 @@ def _min_p_store_filtered(output_ptr, values, threshold, mask):
         tl.where(values.to(tl.float32) < threshold, float("-inf"), values),
         mask,
     )
-
-
-@triton.jit
-def _min_p_cache_encode(values, SIZE: tl.constexpr):
-    """Preserve input bits in shared-memory uint32 words."""
-    if values.dtype == tl.float32:
-        return values.to(tl.uint32, bitcast=True)
-    else:
-        pair = tl.reshape(values.to(tl.uint16, bitcast=True), (SIZE // 2, 2))
-        low, high = tl.split(pair)
-        return low.to(tl.uint32) | (high.to(tl.uint32) << 16)
-
-
-@triton.jit
-def _min_p_cache_decode(words, SIZE: tl.constexpr, TYPE: tl.constexpr):
-    """Restore the original floating-point representation from cache words."""
-    if TYPE == tl.float32:
-        return words.to(TYPE, bitcast=True)
-    else:
-        low = (words & 65535).to(tl.uint16)
-        high = (words >> 16).to(tl.uint16)
-        return tl.reshape(tl.join(low, high), (SIZE,)).to(TYPE, bitcast=True)
-
-
-def _prune_cache_configs(configs, named_args, **kwargs):
-    dtype_bytes = {**named_args, **kwargs}["logits_ptr"].element_size()
-    return [
-        _with_meta(config, WORD_BLOCK=config.kwargs["TILE"] * dtype_bytes // 4)
-        for config in configs
-    ]
-
-
-@libentry()
-@libtuner(
-    configs=[
-        triton.Config(
-            {"TILE": 8192, "REG": reg, "CACHE_BYTES": cache_bytes, "WORD_BLOCK": 0},
-            num_warps=warps,
-            num_stages=1,
-        )
-        for reg, cache_bytes, warps in (
-            (8192, 196608, 8),
-            (16384, 196608, 8),
-            (8192, 196608, 16),
-            (16384, 196608, 16),
-            (32768, 196608, 16),
-            (16384, 131072, 8),
-        )
-    ],
-    key=["N_ROWS", "VOCAB_SIZE"],
-    prune_configs_by={"early_config_prune": _prune_cache_configs},
-    warmup=10,
-    rep=25,
-    use_cuda_graph=True,
-)
-@triton.jit
-def _min_p_cached_word_kernel(
-    logits_ptr,
-    logits_stride,
-    mapping_ptr,
-    min_p_ptr,
-    N_ROWS: tl.constexpr,
-    VOCAB_SIZE: tl.constexpr,
-    TILE: tl.constexpr,
-    REG: tl.constexpr,
-    CACHE_BYTES: tl.constexpr,
-    WORD_BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    row_ptr = logits_ptr + row * logits_stride
-    request = tl.load(mapping_ptr + row)
-    min_p = tl.load(min_p_ptr + request)
-    if min_p != 0.0:
-        CACHE: tl.constexpr = CACHE_BYTES // (
-            logits_ptr.dtype.element_ty.primitive_bitwidth // 8
-        )
-        PACK: tl.constexpr = 32 // logits_ptr.dtype.element_ty.primitive_bitwidth
-        MAIN: tl.constexpr = triton.next_power_of_2(CACHE) // 2
-        EXTRA: tl.constexpr = CACHE - MAIN
-        lane = tl.arange(0, TILE)
-        held_columns = tl.arange(0, REG)
-        held = tl.load(
-            row_ptr + held_columns,
-            held_columns < VOCAB_SIZE,
-            other=float("-inf"),
-        )
-        maxima = tl.full((TILE,), float("-inf"), tl.float32)
-        primary = tle.gpu.alloc(
-            [MAIN // PACK],
-            dtype=tl.uint32,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        secondary = tle.gpu.alloc(
-            [EXTRA // PACK],
-            dtype=tl.uint32,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        for start in range(0, MAIN, TILE):
-            columns = REG + start + lane
-            values = tl.load(
-                row_ptr + columns,
-                columns < VOCAB_SIZE,
-                other=float("-inf"),
-            )
-            pointers = tle.gpu.local_ptr(
-                primary, (start // PACK + tl.arange(0, WORD_BLOCK),)
-            )
-            tl.store(pointers, _min_p_cache_encode(values, TILE))
-            maxima = tl.maximum(maxima, values.to(tl.float32))
-        for start in range(0, EXTRA, TILE):
-            columns = REG + MAIN + start + lane
-            values = tl.load(
-                row_ptr + columns,
-                columns < VOCAB_SIZE,
-                other=float("-inf"),
-            )
-            pointers = tle.gpu.local_ptr(
-                secondary, (start // PACK + tl.arange(0, WORD_BLOCK),)
-            )
-            tl.store(pointers, _min_p_cache_encode(values, TILE))
-            maxima = tl.maximum(maxima, values.to(tl.float32))
-        for start in range(REG + CACHE, VOCAB_SIZE, TILE):
-            columns = start + lane
-            values = tl.load(
-                row_ptr + columns,
-                columns < VOCAB_SIZE,
-                other=float("-inf"),
-            )
-            maxima = tl.maximum(maxima, values.to(tl.float32))
-        maximum = tl.maximum(tl.max(maxima, 0), tl.max(held.to(tl.float32), 0))
-        threshold = maximum + tl.log(min_p)
-        for start in range(REG + CACHE, VOCAB_SIZE, TILE):
-            columns = start + lane
-            values = tl.load(
-                row_ptr + columns,
-                columns < VOCAB_SIZE,
-                other=float("-inf"),
-            )
-            _min_p_store_filtered(
-                row_ptr + columns, values, threshold, columns < VOCAB_SIZE
-            )
-        for start in range(0, MAIN, TILE):
-            columns = REG + start + lane
-            values = _min_p_cache_decode(
-                tl.load(
-                    tle.gpu.local_ptr(
-                        primary, (start // PACK + tl.arange(0, WORD_BLOCK),)
-                    )
-                ),
-                TILE,
-                logits_ptr.dtype.element_ty,
-            )
-            _min_p_store_filtered(
-                row_ptr + columns, values, threshold, columns < VOCAB_SIZE
-            )
-        for start in range(0, EXTRA, TILE):
-            columns = REG + MAIN + start + lane
-            values = _min_p_cache_decode(
-                tl.load(
-                    tle.gpu.local_ptr(
-                        secondary, (start // PACK + tl.arange(0, WORD_BLOCK),)
-                    )
-                ),
-                TILE,
-                logits_ptr.dtype.element_ty,
-            )
-            _min_p_store_filtered(
-                row_ptr + columns, values, threshold, columns < VOCAB_SIZE
-            )
-        _min_p_store_filtered(
-            row_ptr + held_columns, held, threshold, held_columns < VOCAB_SIZE
-        )
 
 
 def _prune_stream_configs(configs, named_args, **kwargs):
@@ -345,7 +165,6 @@ if _HAS_TLE_CLUSTER:
                 num_warps=warps,
                 num_ctas=1,
                 num_stages=1,
-                maxnreg=128,
             )
             for warps in (8, 16)
         ],
@@ -383,10 +202,9 @@ if _HAS_TLE_CLUSTER:
                 [1],
                 dtype=tl.float32,
                 scope=tle.gpu.smem,
+                init_value=local_maximum[None],
                 nv_mma_shared_layout=False,
             )
-            pointer = tle.gpu.local_ptr(scratch, (tl.arange(0, 1),))
-            tl.store(pointer, local_maximum)
             tle.distributed_barrier(MESH)
             maximum = local_maximum
             for peer in tl.static_range(0, PARTS):
@@ -404,6 +222,79 @@ if _HAS_TLE_CLUSTER:
             )
 
 
+    @libentry()
+    @libtuner(
+        configs=[
+            triton.Config(
+                {"BLOCK": 0},
+                num_warps=warps,
+                num_ctas=1,
+                num_stages=1,
+            )
+            for warps in (8, 16)
+        ],
+        key=["N_ROWS", "VOCAB_SIZE"],
+        prune_configs_by={"early_config_prune": _prune_tle_cluster_configs},
+        warmup=10,
+        rep=25,
+        use_cuda_graph=True,
+    )
+    @triton.jit
+    def _min_p_tle_staged_cluster_kernel(
+        logits_ptr,
+        logits_stride,
+        mapping_ptr,
+        min_p_ptr,
+        N_ROWS: tl.constexpr,
+        VOCAB_SIZE: tl.constexpr,
+        PARTS: tl.constexpr,
+        MESH: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64) // PARTS
+        rank = tle.shard_id(MESH, "cluster_x")
+        request = tl.load(mapping_ptr + row)
+        min_p = tl.load(min_p_ptr + request).to(tl.float32)
+        if min_p != 0.0:
+            columns = rank.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+            values = tl.load(
+                logits_ptr + row * logits_stride + columns,
+                columns < VOCAB_SIZE,
+                other=-float("inf"),
+            )
+            staged_values = tle.gpu.alloc(
+                values.shape,
+                dtype=values.dtype,
+                scope=tle.gpu.smem,
+                init_value=values,
+                nv_mma_shared_layout=False,
+            )
+            local_maximum = tl.max(values.to(tl.float32), 0)
+            scratch = tle.gpu.alloc(
+                [1],
+                dtype=tl.float32,
+                scope=tle.gpu.smem,
+                init_value=local_maximum[None],
+                nv_mma_shared_layout=False,
+            )
+            tle.distributed_barrier(MESH)
+            maximum = local_maximum
+            for peer in tl.static_range(0, PARTS):
+                remote_scratch = tle.remote(scratch, peer, scope=MESH)
+                peer_pointer = tle.gpu.local_ptr(remote_scratch, (tl.arange(0, 1),))
+                peer_maximum = tl.max(tl.load(peer_pointer), 0)
+                maximum = tl.maximum(maximum, peer_maximum)
+            tle.distributed_barrier(MESH)
+            threshold = maximum + tl.log(min_p)
+            values = tl.load(tle.gpu.local_ptr(staged_values))
+            _min_p_store_filtered(
+                logits_ptr + row * logits_stride + columns,
+                values,
+                threshold,
+                columns < VOCAB_SIZE,
+            )
+
+
 def apply_min_p(
     logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, min_p: torch.Tensor
 ) -> None:
@@ -412,7 +303,10 @@ def apply_min_p(
     if num_tokens == 0 or vocab_size == 0:
         return
     kernel = _select_min_p_kernel(logits)
-    if _HAS_TLE_CLUSTER and kernel is _min_p_tle_cluster_kernel:
+    if _HAS_TLE_CLUSTER and kernel in (
+        _min_p_tle_cluster_kernel,
+        _min_p_tle_staged_cluster_kernel,
+    ):
         kernel[(num_tokens,)](
             logits,
             logits.stride(0),
