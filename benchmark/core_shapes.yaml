@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+apply_min_p:
+  shapes:
+    - [1, 128256, bfloat16]
+    - [1, 128256, float32]
+    - [64, 128256, bfloat16]
+    - [256, 128256, float16]
+    - [256, 128256, bfloat16]
+    - [128, 151936, bfloat16]
+    - [17, 129280, bfloat16]
+    - [100, 32000, float16]
+  shape_desc: "batch, vocab, dtype"
+
 concat_mla_q:
   shapes:
     - [1, 64, 512, 64]

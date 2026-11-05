@@ -101,6 +101,7 @@ from flaggems_vllm.ops.mhc import (
     mhc_pre,
     sinkhorn_forward,
 )
+from flaggems_vllm.ops.min_p import apply_min_p
 from flaggems_vllm.ops.qwen4 import (
     ple_short_conv_,
     ple_gate_norm,
@@ -227,6 +228,7 @@ from flaggems_vllm.ops.vit_attention import (
 __all__ = [
     "act_quant_triton",
     "add_rms_norm",
+    "apply_min_p",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
     "attn_res",
