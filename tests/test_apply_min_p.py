@@ -147,6 +147,7 @@ def test_apply_min_p_infinities_and_disabled_rows(dtype):
     _check(logits, mapping, min_p)
 
 
+@pytest.mark.apply_min_p
 def test_apply_min_p_probability_definition():
     # Independent softmax oracle, with values away from the threshold boundary.
     logits = torch.tensor(
