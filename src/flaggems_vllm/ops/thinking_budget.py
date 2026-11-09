@@ -29,9 +29,8 @@ def _load_effective_token(
 
 
 @triton.jit
-def _update_committed_marker_cache_kernel(
-    req_ids_ptr,
-    thinking_token_budget_ptr,
+def _committed_marker_state(
+    req_state_idx,
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
@@ -45,11 +44,6 @@ def _update_committed_marker_cache_kernel(
     MAX_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    req_state_idx = tl.load(req_ids_ptr + tl.program_id(0))
-    budget = tl.load(thinking_token_budget_ptr + req_state_idx)
-    if budget < 0:
-        return
-
     total_len = tl.load(total_len_ptr + req_state_idx)
     scan_pos = tl.load(cached_scan_pos_ptr + req_state_idx)
     last_start = tl.load(cached_last_start_ptr + req_state_idx)
@@ -124,21 +118,23 @@ def _update_committed_marker_cache_kernel(
     if new_scan_pos < 0:
         new_scan_pos = 0
     tl.store(cached_scan_pos_ptr + req_state_idx, new_scan_pos)
+    return total_len, last_start, last_end
 
 
 @triton.jit
-def _thinking_budget_kernel(
+def _apply_row_from_state(
+    token_idx,
+    req_state_idx,
+    budget,
+    total_len,
+    last_start,
+    last_end,
     logits_ptr,
     logits_stride,
-    expanded_idx_mapping_ptr,
-    thinking_token_budget_ptr,
     all_token_ids_ptr,
     all_token_ids_stride,
-    total_len_ptr,
     input_ids_ptr,
     expanded_local_pos_ptr,
-    cached_last_start_ptr,
-    cached_last_end_ptr,
     reasoning_start_token_ids_ptr,
     natural_reasoning_end_token_ids_ptr,
     reasoning_end_token_ids_ptr,
@@ -146,19 +142,10 @@ def _thinking_budget_kernel(
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
 ):
-    token_idx = tl.program_id(0).to(tl.int64)
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-    budget = tl.load(thinking_token_budget_ptr + req_state_idx)
-    if budget < 0:
-        return
-
+    token_idx = token_idx.to(tl.int64)
     local_pos = tl.load(expanded_local_pos_ptr + token_idx)
     cur_req_first_pos = token_idx - local_pos
-    total_len = tl.load(total_len_ptr + req_state_idx)
     effective_len = total_len + local_pos
-
-    last_start = tl.load(cached_last_start_ptr + req_state_idx)
-    last_end = tl.load(cached_last_end_ptr + req_state_idx)
 
     start_lo = total_len - START_LEN + 1
     if start_lo < 0:
@@ -241,6 +228,85 @@ def _thinking_budget_kernel(
     tl.store(logits_ptr + token_idx * logits_stride + force_token_id, 1.0e9)
 
 
+@triton.jit
+def _fused_thinking_budget_kernel(
+    logits_ptr,
+    logits_stride,
+    req_ids_ptr,
+    expanded_idx_mapping_ptr,
+    thinking_token_budget_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    total_len_ptr,
+    input_ids_ptr,
+    expanded_local_pos_ptr,
+    cached_last_start_ptr,
+    cached_last_end_ptr,
+    cached_scan_pos_ptr,
+    reasoning_start_token_ids_ptr,
+    natural_reasoning_end_token_ids_ptr,
+    reasoning_end_token_ids_ptr,
+    START_LEN: tl.constexpr,
+    NATURAL_END_LEN: tl.constexpr,
+    END_LEN: tl.constexpr,
+    MAX_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NUM_TOKENS: tl.constexpr,
+):
+    MAP_BLOCK: tl.constexpr = triton.next_power_of_2(max(1, NUM_TOKENS))
+    pid = tl.program_id(0)
+    req_state_idx = tl.load(req_ids_ptr + pid)
+    budget = tl.load(thinking_token_budget_ptr + req_state_idx)
+    if budget < 0:
+        return
+
+    total_len, last_start, last_end = _committed_marker_state(
+        req_state_idx,
+        all_token_ids_ptr,
+        all_token_ids_stride,
+        total_len_ptr,
+        cached_last_start_ptr,
+        cached_last_end_ptr,
+        cached_scan_pos_ptr,
+        reasoning_start_token_ids_ptr,
+        natural_reasoning_end_token_ids_ptr,
+        START_LEN,
+        NATURAL_END_LEN,
+        MAX_LEN,
+        BLOCK,
+    )
+    rows = tl.arange(0, MAP_BLOCK)
+    mapping = tl.load(
+        expanded_idx_mapping_ptr + rows,
+        mask=rows < NUM_TOKENS,
+        other=-1,
+    )
+    matches = (rows < NUM_TOKENS) & (mapping == req_state_idx)
+    row = tl.min(tl.where(matches, rows, NUM_TOKENS), 0)
+    while row < NUM_TOKENS:
+        _apply_row_from_state(
+            row,
+            req_state_idx,
+            budget,
+            total_len,
+            last_start,
+            last_end,
+            logits_ptr,
+            logits_stride,
+            all_token_ids_ptr,
+            all_token_ids_stride,
+            input_ids_ptr,
+            expanded_local_pos_ptr,
+            reasoning_start_token_ids_ptr,
+            natural_reasoning_end_token_ids_ptr,
+            reasoning_end_token_ids_ptr,
+            START_LEN,
+            NATURAL_END_LEN,
+            END_LEN,
+        )
+        row = tl.min(tl.where(matches & (rows > row), rows, NUM_TOKENS), 0)
+
+
 def apply_thinking_budget(
     logits: torch.Tensor,
     req_ids: torch.Tensor,
@@ -262,26 +328,11 @@ def apply_thinking_budget(
     natural_end_len = natural_reasoning_end_token_ids.shape[0]
     end_len = reasoning_end_token_ids.shape[0]
 
-    _update_committed_marker_cache_kernel[(req_ids.shape[0],)](
-        req_ids,
-        thinking_token_budget,
-        all_token_ids,
-        all_token_ids.stride(0),
-        total_len,
-        cached_last_start,
-        cached_last_end,
-        cached_scan_pos,
-        reasoning_start_token_ids,
-        natural_reasoning_end_token_ids,
-        START_LEN=start_len,
-        NATURAL_END_LEN=natural_end_len,
-        MAX_LEN=max(start_len, natural_end_len),
-        BLOCK=_COLD_SCAN_BLOCK,
-    )
-
-    _thinking_budget_kernel[(num_tokens,)](
+    num_reqs = req_ids.shape[0]
+    _fused_thinking_budget_kernel[(num_reqs,)](
         logits,
         logits.stride(0),
+        req_ids,
         expanded_idx_mapping,
         thinking_token_budget,
         all_token_ids,
@@ -291,10 +342,14 @@ def apply_thinking_budget(
         expanded_local_pos,
         cached_last_start,
         cached_last_end,
+        cached_scan_pos,
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
         reasoning_end_token_ids,
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,
+        MAX_LEN=max(start_len, natural_end_len),
+        BLOCK=_COLD_SCAN_BLOCK,
+        NUM_TOKENS=num_tokens,
     )
