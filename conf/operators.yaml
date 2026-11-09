@@ -61,6 +61,18 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '2.0'
+  - id: apply_thinking_budget
+    description: |
+      Applies per-request thinking token budgets to logits in place and updates reasoning marker caches.
+    for:
+      - vllm.v1.worker.gpu.sample.thinking_budget.apply_thinking_budget
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.5'
   - id: beam_search_score
     description: Computes beam search scores by adding cumulative log probabilities
       with new token scores.
