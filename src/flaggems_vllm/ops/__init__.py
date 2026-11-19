@@ -57,11 +57,11 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
-    fused_recurrent_kda,
 )
 from flaggems_vllm.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
+from flaggems_vllm.ops.gumbel_sample import gumbel_sample
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
     flash_attn_varlen_func,
@@ -124,6 +124,7 @@ from flaggems_vllm.ops.input_batch import get_num_sampled_and_rejected
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
+from flaggems_vllm.ops.logprob import compute_topk_scores
 from flaggems_vllm.ops.ihc import (
     ihc_post,
     ihc_post_ref,
@@ -146,6 +147,7 @@ from flaggems_vllm.ops.qwen4 import (
     NULL_BLOCK_ID,
     grouped_gemma_rmsnorm,
     hc_combine,
+    hc_down_silu,
     ple_conv,
     ple_short_conv_,
     ple_gate_norm,
@@ -200,6 +202,9 @@ from flaggems_vllm.ops.reglu import dreglu, reglu
 from flaggems_vllm.ops.rejection_sampler import gather_draft_sampled
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
+from flaggems_vllm.ops.reshape_and_cache_flash_strided import (
+    reshape_and_cache_flash_strided,
+)
 from flaggems_vllm.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
@@ -256,6 +261,7 @@ from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
 )
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
+    fused_recurrent_kda,
     recurrent_kda,
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
@@ -307,6 +313,7 @@ __all__ = [
     "clear_fused_matmul_reduce_scatter_cache",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
+    "compute_topk_scores",
     "concat_and_cache_mla",
     "concat_mla_q",
     "concat_query",
@@ -370,8 +377,10 @@ __all__ = [
     "get_num_sampled_and_rejected",
     "grouped_gemma_rmsnorm",
     "grouped_topk",
+    "gumbel_sample",
     "hadamard128",
     "hc_combine",
+    "hc_down_silu",
     "hc_head_fused_kernel",
     "hc_split_sinkhorn",
     "ihc_post",
@@ -444,6 +453,7 @@ __all__ = [
     "reglu",
     "reshape_and_cache",
     "reshape_and_cache_flash",
+    "reshape_and_cache_flash_strided",
     "router_gemm",
     "rwkv_ka_fusion",
     "rwkv_mm_sparsity",
