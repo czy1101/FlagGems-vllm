@@ -132,6 +132,13 @@ def _use_radix_final_for_prefill(vocab_size):
 @triton.jit
 def _convert_to_uint32(x):
     bits = x.to(tl.uint32, bitcast=True)
+    exp_mask = tl.full(bits.shape, 0x7F800000, tl.uint32)
+    mantissa_mask = tl.full(bits.shape, 0x007FFFFF, tl.uint32)
+    is_nan = ((bits & exp_mask) == exp_mask) & ((bits & mantissa_mask) != 0)
+    # NaNs are selected by topk even when their sign bit is set. Preserve the
+    # original logits separately; this canonicalization applies only to the
+    # radix-selection key.
+    bits = tl.where(is_nan, tl.full(bits.shape, 0x7FC00000, tl.uint32), bits)
     sign_mask = tl.full(bits.shape, 0x80000000, tl.uint32)
     sign_set = (bits & sign_mask) != 0
     inv = (~bits) & tl.full(bits.shape, 0x7FFFFFFF, tl.uint32)
@@ -144,6 +151,10 @@ def _extract_bin_idx(x, in_range, pattern, STEP: tl.constexpr):
     if STEP == 0:
         h = x.to(tl.float16)
         bits = h.to(tl.uint16, bitcast=True)
+        exp_mask = tl.full(bits.shape, 0x7C00, tl.uint16)
+        mantissa_mask = tl.full(bits.shape, 0x03FF, tl.uint16)
+        is_nan = ((bits & exp_mask) == exp_mask) & ((bits & mantissa_mask) != 0)
+        bits = tl.where(is_nan, tl.full(bits.shape, 0x7E00, tl.uint16), bits)
         sign_mask = tl.full(bits.shape, 0x8000, tl.uint16)
         sign_set = (bits & sign_mask) != 0
         inv = (~bits) & tl.full(bits.shape, 0x7FFF, tl.uint16)
@@ -1163,20 +1174,30 @@ def _top_k_per_row_job(
                     original_i = tl.load(s_histogram_ptr + pos, mask=valid, other=0)
                 for j in tl.range(0, final_cnt):
                     logit_j = tl.load(s_final_logits_ptr + j)
+                    bits_i = logit_i.to(tl.uint32, bitcast=True)
+                    bits_j = logit_j.to(tl.uint32, bitcast=True)
+                    sign_mask = tl.full((), 0x80000000, tl.uint32)
+                    value_key_i = tl.where(
+                        (bits_i & sign_mask) != 0,
+                        (~bits_i) & tl.full((), 0x7FFFFFFF, tl.uint32),
+                        bits_i ^ sign_mask,
+                    )
+                    value_key_j = tl.where(
+                        (bits_j & sign_mask) != 0,
+                        (~bits_j) & tl.full((), 0x7FFFFFFF, tl.uint32),
+                        bits_j ^ sign_mask,
+                    )
+                    value_less = value_key_i < value_key_j
+                    value_equal = value_key_i == value_key_j
                     if HAS_TLE:
-                        better = (logit_i < logit_j) | (
-                            (logit_i == logit_j) & (pos < j)
-                        )
+                        tie_better = pos < j
                     elif CANONICAL_OUTPUT or MERGE_BLOCKS:
                         original_j = tl.load(s_histogram_ptr + j)
-                        better = (logit_i < logit_j) | (
-                            (logit_i == logit_j) & (original_i > original_j)
-                        )
+                        tie_better = original_i > original_j
                     else:
                         # Stable collection visits original indices in order.
-                        better = (logit_i < logit_j) | (
-                            (logit_i == logit_j) & (pos > j)
-                        )
+                        tie_better = pos > j
+                    better = value_less | (value_equal & tie_better)
                     out_rank = out_rank + (valid & better).to(tl.int32)
                 dst_pos = base_idx + out_rank
                 take = valid & (dst_pos < TOPK)
