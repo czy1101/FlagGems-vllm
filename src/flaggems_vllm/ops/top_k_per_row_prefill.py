@@ -128,7 +128,26 @@ def _use_radix_final_for_prefill(vocab_size):
 
 
 @triton.jit
+def _is_nan_fp32_bits(bits):
+    exponent = bits & tl.full(bits.shape, 0x7F800000, tl.uint32)
+    mantissa = bits & tl.full(bits.shape, 0x007FFFFF, tl.uint32)
+    return (exponent == 0x7F800000) & (mantissa != 0)
+
+
+@triton.jit
 def _convert_to_uint32(x):
+    bits = x.to(tl.uint32, bitcast=True)
+    sign_mask = tl.full(bits.shape, 0x80000000, tl.uint32)
+    is_nan = _is_nan_fp32_bits(bits)
+    canonical_nan = tl.full(bits.shape, 0x7FC00000, tl.uint32)
+    bits = tl.where(is_nan, canonical_nan, bits)
+    sign_set = (bits & sign_mask) != 0
+    inv = (~bits) & tl.full(bits.shape, 0x7FFFFFFF, tl.uint32)
+    return tl.where(sign_set, bits, inv)
+
+
+@triton.jit
+def _convert_to_uint32_preserve_nan_sign(x):
     bits = x.to(tl.uint32, bitcast=True)
     sign_mask = tl.full(bits.shape, 0x80000000, tl.uint32)
     sign_set = (bits & sign_mask) != 0
@@ -140,8 +159,14 @@ def _convert_to_uint32(x):
 def _extract_bin_idx(x, in_range, pattern, STEP: tl.constexpr):
     is_partial_match = in_range
     if STEP == 0:
+        raw_bits = x.to(tl.uint32, bitcast=True)
+        is_nan = _is_nan_fp32_bits(raw_bits)
         h = x.to(tl.float16)
         bits = h.to(tl.uint16, bitcast=True)
+        # FP32-to-FP16 NaN casts differ across backends; canonicalize for
+        # selection so every NaN enters the same candidate bucket.
+        canonical_nan = tl.full(bits.shape, 0x7E00, tl.uint16)
+        bits = tl.where(is_nan, canonical_nan, bits)
         sign_mask = tl.full(bits.shape, 0x8000, tl.uint16)
         sign_set = (bits & sign_mask) != 0
         inv = (~bits) & tl.full(bits.shape, 0x7FFF, tl.uint16)
@@ -162,8 +187,12 @@ def _extract_bin_idx(x, in_range, pattern, STEP: tl.constexpr):
 
 @triton.jit
 def _convert_to_trt_uint16_hi11(x):
+    raw_bits = x.to(tl.uint32, bitcast=True)
+    is_nan = _is_nan_fp32_bits(raw_bits)
     h = x.to(tl.float16)
     bits = h.to(tl.uint16, bitcast=True)
+    canonical_nan = tl.full(bits.shape, 0x7E00, tl.uint16)
+    bits = tl.where(is_nan, canonical_nan, bits)
     sign_mask = tl.full(bits.shape, 0x8000, tl.uint16)
     sign_set = (bits & sign_mask) != 0
     inv = (~bits) & tl.full(bits.shape, 0x7FFF, tl.uint16)
@@ -1035,10 +1064,14 @@ def _top_k_per_row_job(
                     mask=valid,
                     other=0,
                 )
+                key_i = _convert_to_uint32_preserve_nan_sign(logit_i)
                 out_rank = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
                 for j in tl.range(0, final_cnt):
                     logit_j = tl.load(s_final_logits_ptr + j)
-                    better = (logit_i < logit_j) | ((logit_i == logit_j) & (pos < j))
+                    key_j = _convert_to_uint32_preserve_nan_sign(logit_j)
+                    same_key = key_i == key_j
+                    both_zero = (logit_i == 0) & (logit_j == 0)
+                    better = (key_i > key_j) | ((same_key | both_zero) & (pos < j))
                     out_rank = out_rank + (valid & better).to(tl.int32)
                 dst_pos = base_idx + out_rank
                 take = valid & (dst_pos < TOPK)
