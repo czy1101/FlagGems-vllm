@@ -448,6 +448,9 @@ def _pack_descending_sort_key(values, token_ids):
     value_mask = tl.full((), (1 << value_bits) - 1, tl.uint32)
     sign_bit = tl.full((), 1 << (value_bits - 1), tl.uint32)
     bits = values.to(tl.uint32, bitcast=True)
+    is_nan = (((bits & 0x7F800000) == 0x7F800000) & ((bits & 0x007FFFFF) != 0))
+    canonical_nan = (bits & sign_bit) | tl.full(bits.shape, 0x7FC00000, tl.uint32)
+    bits = tl.where(is_nan, canonical_nan, bits)
     flip = tl.where(bits & sign_bit != 0, value_mask, sign_bit)
     value_key = bits ^ flip
     token_key = value_mask - token_ids.to(tl.uint32)
