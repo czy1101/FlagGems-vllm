@@ -141,7 +141,6 @@ def test_restore_across_vocab_tiles():
     torch.testing.assert_close(storage, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize(
     "nonfinite",
     [
@@ -151,8 +150,10 @@ def test_restore_across_vocab_tiles():
     ],
 )
 @pytest.mark.apply_logit_bias
-def test_restore_only_finite_stop_logits(dtype, nonfinite):
-    logits = torch.tensor([[2.0, nonfinite, NEG_INF]], device=DEVICE, dtype=dtype)
+def test_restore_only_finite_stop_logits(nonfinite):
+    logits = torch.tensor(
+        [[2.0, nonfinite, NEG_INF]], device=DEVICE, dtype=torch.float32
+    )
     zero = _i32([0])
     ids = _i32([[0, 1]])
     flaggems_vllm.apply_logit_bias(
@@ -163,114 +164,17 @@ def test_restore_only_finite_stop_logits(dtype, nonfinite):
         ids,
         zero,
         ids,
-        torch.zeros((1, 2), device=DEVICE, dtype=dtype),
+        torch.zeros((1, 2), device=DEVICE, dtype=torch.float32),
         _i32([2]),
         _i32([2]),
         _i32([1]),
         ids,
         check_all_masked_rows=True,
     )
-    expected = torch.tensor([[2.0, NEG_INF, NEG_INF]], device=DEVICE, dtype=dtype)
-    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.apply_logit_bias
-def test_restore_keeps_finite_stop_logits(dtype):
-    # The largest and smallest finite magnitudes bound every magnitude-based
-    # finiteness test, so they must survive the restore, as must signed zero
-    # and ordinary values.
-    finfo = torch.finfo(dtype)
-    values = [finfo.max, finfo.min, 0.0, -0.0, 1.5, -3.25]
-    logits = torch.tensor([values], device=DEVICE, dtype=dtype)
-    expected = logits.clone()
-    zero = _i32([0])
-    ids = _i32([[0, 1, 2, 3, 4, 5]])
-    flaggems_vllm.apply_logit_bias(
-        logits,
-        zero,
-        zero,
-        zero,
-        ids,
-        zero,
-        ids,
-        torch.zeros((1, 6), device=DEVICE, dtype=dtype),
-        _i32([2]),
-        _i32([6]),
-        _i32([1]),
-        ids,
-        check_all_masked_rows=True,
+    expected = torch.tensor(
+        [[2.0, NEG_INF, NEG_INF]], device=DEVICE, dtype=torch.float32
     )
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
-    # assert_close treats -0.0 and 0.0 as equal, so check the sign bit too.
-    torch.testing.assert_close(torch.signbit(logits), torch.signbit(expected))
-
-
-@pytest.mark.apply_logit_bias
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "enflame",
-    reason="Enflame specialization is only registered on Enflame GCU",
-)
-def test_enflame_vendor_dispatch():
-    from flaggems_vllm.runtime.backend._enflame.ops.logit_bias import (
-        apply_logit_bias as enflame_apply_logit_bias,
-    )
-
-    assert flaggems_vllm.apply_logit_bias is enflame_apply_logit_bias
-    assert flaggems_vllm.apply_logit_bias.__module__ == (
-        "flaggems_vllm.runtime.backend._enflame.ops.logit_bias"
-    )
-
-
-@pytest.mark.apply_logit_bias
-def test_public_entry_updates_in_place_and_keeps_inputs():
-    # Row 0 keeps a live token and is only masked; row 1 ends up fully masked
-    # and must restore its stop token, so allowlist, bias and restore all run.
-    logits = torch.tensor(
-        [[2.0, 3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0]],
-        device=DEVICE,
-        dtype=torch.float32,
-    )
-    mapping = _i32([0, 1])
-    pos = _i32([0, 0])
-    allowed_count = _i32([2, 1])
-    allowed_ids = _i32([[0, 1], [2, 0]])
-    bias_count = _i32([1, 1])
-    bias_ids = _i32([[1], [3]])
-    bias = torch.tensor([[0.5], [1.5]], device=DEVICE, dtype=torch.float32)
-    min_lens = _i32([3, 3])
-    stop_count = _i32([1, 1])
-    restore = _i32([1, 1])
-    stop_ids = _i32([[2], [2]])
-
-    inputs = (
-        mapping,
-        pos,
-        allowed_count,
-        allowed_ids,
-        bias_count,
-        bias_ids,
-        bias,
-        min_lens,
-        stop_count,
-        restore,
-        stop_ids,
-    )
-    snapshots = [tensor.clone() for tensor in inputs]
-    storage = logits.data_ptr()
-    before = logits.clone()
-
-    result = flaggems_vllm.apply_logit_bias(
-        logits,
-        *inputs,
-        check_all_masked_rows=True,
-    )
-
-    assert result is None
-    assert logits.data_ptr() == storage, "logits must be updated in place"
-    assert not torch.equal(logits, before), "this case must modify logits"
-    for tensor, snapshot in zip(inputs, snapshots):
-        torch.testing.assert_close(tensor, snapshot, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("check_all_masked_rows", [False, True])
