@@ -207,16 +207,23 @@ def test_restore_keeps_finite_stop_logits(dtype):
 
 
 @pytest.mark.apply_logit_bias
-def test_public_entry_dispatch_and_input_purity():
-    import flaggems_vllm.ops as ops
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "enflame",
+    reason="Enflame specialization is only registered on Enflame GCU",
+)
+def test_enflame_vendor_dispatch():
+    from flaggems_vllm.runtime.backend._enflame.ops.logit_bias import (
+        apply_logit_bias as enflame_apply_logit_bias,
+    )
 
-    if flaggems_vllm.vendor_name == "enflame":
-        assert flaggems_vllm.apply_logit_bias.__module__ == (
-            "flaggems_vllm.runtime.backend._enflame.ops.logit_bias"
-        )
-    else:
-        assert flaggems_vllm.apply_logit_bias is ops.apply_logit_bias
+    assert flaggems_vllm.apply_logit_bias is enflame_apply_logit_bias
+    assert flaggems_vllm.apply_logit_bias.__module__ == (
+        "flaggems_vllm.runtime.backend._enflame.ops.logit_bias"
+    )
 
+
+@pytest.mark.apply_logit_bias
+def test_public_entry_updates_in_place_and_keeps_inputs():
     # Row 0 keeps a live token and is only masked; row 1 ends up fully masked
     # and must restore its stop token, so allowlist, bias and restore all run.
     logits = torch.tensor(
