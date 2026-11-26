@@ -13,8 +13,9 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._enflame.ops.logit_bias import apply_logit_bias
 from flaggems_vllm.runtime.backend._enflame.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
 
-__all__ = ["scaled_int8_quant"]
+__all__ = ["apply_logit_bias", "scaled_int8_quant"]
