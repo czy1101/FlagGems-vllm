@@ -263,7 +263,7 @@ def test_public_entry_dispatch_and_input_purity():
     assert logits.data_ptr() == storage, "logits must be updated in place"
     assert not torch.equal(logits, before), "this case must modify logits"
     for tensor, snapshot in zip(inputs, snapshots):
-        torch.testing.assert_close(tensor, snapshot)
+        torch.testing.assert_close(tensor, snapshot, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("check_all_masked_rows", [False, True])
