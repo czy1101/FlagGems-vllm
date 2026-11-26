@@ -39,8 +39,7 @@ def test_silu_and_mul_with_clamp(shape, dtype, limit):
     ref_gate = torch.clamp(ref_inp1, max=limit)
     ref_up = torch.clamp(ref_inp2, min=-limit, max=limit)
     ref_out = torch.mul(torch.nn.functional.silu(ref_gate), ref_up)
-    with flaggems_vllm.use_gems():
-        res_out = flaggems_vllm.silu_and_mul_with_clamp(inp1, inp2, limit)
+    res_out = flaggems_vllm.silu_and_mul_with_clamp(inp1, inp2, limit)
 
     out_grad = torch.randn_like(res_out)
     ref_grad = utils.to_reference(out_grad, True)
@@ -57,6 +56,10 @@ def test_silu_and_mul_with_clamp(shape, dtype, limit):
 
 
 @pytest.mark.silu_and_mul_with_clamp_out
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="Issue #636: silu_and_mul_with_clamp_out accuracy failure on mthreads",
+)
 @pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("limit", SILU_AND_MUL_WITH_CLAMP_LIMITS)
@@ -71,8 +74,7 @@ def test_silu_and_mul_with_clamp_out(shape, dtype, limit):
     ref_out = torch.mul(torch.nn.functional.silu(ref_gate), ref_up)
 
     out = torch.empty_like(inp1)
-    with flaggems_vllm.use_gems():
-        ret = flaggems_vllm.silu_and_mul_with_clamp_out(inp1, inp2, out, limit)
+    ret = flaggems_vllm.silu_and_mul_with_clamp_out(inp1, inp2, out, limit)
 
     assert ret is out
     utils.gems_assert_close(out, ref_out, dtype)

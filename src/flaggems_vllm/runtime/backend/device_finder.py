@@ -31,7 +31,6 @@ class DeviceDetector:
 
     def __new__(cls, *args, **kargs):
         if cls._instance is None:
-            cls._instance = super(DeviceDetector, cls).__new__(cls)
             cls._instance = super().__new__(cls)
         return cls._instance
 
@@ -106,6 +105,8 @@ class DeviceDetector:
             "FLAGGEMS_VENDOR",
             "GEMS_BACKEND",
             "FLAGGEMS_BACKEND",
+            # Documented vendor override (also exported by tools/setup.sh).
+            "DNN_VENDOR",
         )
         for key in env_keys:
             if key in os.environ:

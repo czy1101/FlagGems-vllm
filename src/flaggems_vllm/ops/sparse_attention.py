@@ -16,6 +16,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
+
 
 # ---------------------------------------------------------------------------
 # Triton kernel: sparse attention with attention-sink
@@ -45,6 +48,7 @@ def sparse_attn_triton_kernel(
     stride_idxk,
     scale,
     topk,
+    H_ACTUAL,
     BLOCK: tl.constexpr,
     D: tl.constexpr,
     H: tl.constexpr,
@@ -56,8 +60,9 @@ def sparse_attn_triton_kernel(
     q_base = Q + pid_b * stride_qb + pid_m * stride_qm
     offs_h = tl.arange(0, H)
     offs_d = tl.arange(0, D)
+    h_mask = offs_h < H_ACTUAL
     q_ptrs = q_base + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd
-    q_block = tl.load(q_ptrs)  # (H, D) bf16
+    q_block = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0)  # (H, D) bf16
 
     # ---- base pointers ----
     kv_base = KV + pid_b * stride_kvb
@@ -89,9 +94,8 @@ def sparse_attn_triton_kernel(
         # -- scores: Q @ KV^T -> (H, BLOCK) via GEMM --
         acc_s = tl.dot(q_block, tl.trans(kv_block))  # (H, D) @ (D, BLOCK) = (H, BLOCK)
         acc_s = acc_s * scale
-        # mask invalid positions to -inf
-        mask_bias = tl.where(valid_mask, 0.0, float("-inf"))  # (BLOCK,)
-        acc_s = acc_s + mask_bias[None, :]  # broadcast: (H, BLOCK)
+        # mask invalid positions to -inf (apply on 2D tensor to avoid layout mismatch)
+        acc_s = tl.where(valid_mask[None, :], acc_s, float("-inf"))
 
         # -- online softmax update --
         scores_max_prev = scores_max
@@ -109,7 +113,7 @@ def sparse_attn_triton_kernel(
         sum_exp = sum_exp * correction + scores_sum
 
     # ---- incorporate attn_sink ----
-    sink_vals = tl.load(attn_sink + offs_h)  # (H,)
+    sink_vals = tl.load(attn_sink + offs_h, mask=h_mask, other=0.0)  # (H,)
     sum_exp = sum_exp + tl.exp(sink_vals - scores_max)
 
     # ---- normalize ----
@@ -118,12 +122,32 @@ def sparse_attn_triton_kernel(
     # ---- store output: (H, D) ----
     o_base = O + pid_b * stride_ob + pid_m * stride_om
     o_ptrs = o_base + offs_h[:, None] * stride_oh + offs_d[None, :] * stride_od
-    tl.store(o_ptrs, acc_o.to(tl.bfloat16))
+    tl.store(o_ptrs, acc_o.to(tl.bfloat16), mask=h_mask[:, None])
 
 
 # ---------------------------------------------------------------------------
 # Python wrapper
 # ---------------------------------------------------------------------------
+def _pipeline_launch_options(h_padded, num_ctas, topk, device):
+    """Pipelining of the top-k KV loop with FlagTree (measured on H20).
+
+    The loop reads the token ids, then the KV rows they select. With 16 or 32
+    heads per program and at most one CTA per SM, prefetching the KV rows two
+    stages ahead and reading the ids synchronously is fastest; a short loop
+    (top-k <= 256) or 64+ heads per program prefer 2 stages. Thresholds
+    measured on H20 (D=512, top-k 128-2048).
+    """
+    sync_index = pipeline_options(pipeline_index_prefetch=False)
+    if not sync_index:
+        return {}
+    if topk <= 256 or h_padded >= 64:
+        return {"num_stages": 2}
+    num_sms = torch_device_fn.get_device_properties(device).multi_processor_count
+    if h_padded == 32 or num_ctas <= num_sms:
+        return sync_index
+    return {}
+
+
 def sparse_attn_triton(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -135,8 +159,10 @@ def sparse_attn_triton(
     topk = topk_idxs.shape[-1]
     o = torch.empty_like(q)
     BLOCK = 64
+    h_padded = max(16, triton.next_power_of_2(h))
 
     grid = (m, b)  # each program handles ALL h heads
+    launch_options = _pipeline_launch_options(h_padded, m * b, topk, q.device)
     sparse_attn_triton_kernel[grid](
         q,
         kv,
@@ -159,9 +185,11 @@ def sparse_attn_triton(
         topk_idxs.stride(2),
         softmax_scale,
         topk,
+        h,
         BLOCK=BLOCK,
         D=d,
-        H=h,
+        H=h_padded,
         num_warps=8,  # 256 threads, matching tilelang
+        **launch_options,
     )
     return o

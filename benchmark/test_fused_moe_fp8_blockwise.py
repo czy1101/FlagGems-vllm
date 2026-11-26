@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from math import ceil
 
 import pytest
@@ -21,16 +22,26 @@ import flaggems_vllm
 
 from . import base
 
+# Per-vendor native compute precision: (fp8, int8), per vendor documentation.
+# A device that reports CUDA capability in the Hopper range is not enough: some
+# non-NVIDIA backends report device="cuda" with a Hopper-like capability while
+# their hardware has no native FP8 path. Vendors left unlisted are skipped.
+_OFFICIAL_PRECISION = {
+    "nvidia": (True, True),  # Hopper tensor cores support FP8/FP16 mixed precision
+    "mthreads": (True, True),  # hardware-native FP8 compute
+    "hygon": (False, True),  # only the BW1100 (gfx938) generation has an FP8 path
+    "metax": (False, True),  # no FP8 in the compiler MMA intrinsics
+    "thead": (False, True),  # FP8 is not part of the 810E precision list
+    "ascend": (False, True),
+}
+_SUPPORTS_FP8, _SUPPORTS_INT8 = _OFFICIAL_PRECISION.get(
+    flaggems_vllm.vendor_name, (False, False)
+)
 
-def is_cuda_available():
-    if flaggems_vllm.device != "cuda":
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    sm_version_num = major * 10 + minor
-    return sm_version_num >= 90 and sm_version_num < 100
-
-
-CUDA_AVAILABLE = is_cuda_available()
+# Vendor has native FP8, but this vLLM build lacks the block-wise quant op.
+_FP8_BLOCKWISE_UNSUPPORTED = {
+    "mthreads",  # no _C.per_token_group_fp8_quant
+}
 
 
 try:
@@ -41,6 +52,24 @@ try:
     HAS_VLLM_FUSED_MOE = True
 except ImportError:
     HAS_VLLM_FUSED_MOE = False
+
+
+def _supports_keyword(op, keyword):
+    try:
+        parameters = inspect.signature(op).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+# vLLM versions differ: newer ones require ``inplace`` (no default), older ones
+# do not accept the keyword at all.
+VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
+    vllm_fused_experts_impl, "inplace"
+)
 
 
 DEFAULT_BLOCK_SHAPE = [128, 128]
@@ -76,6 +105,12 @@ class FusedMoEFP8BlockwiseBenchmark(base.Benchmark):
             (64, 256, 7168, 2048, 8),
             (128, 256, 7168, 2048, 8),
             (256, 256, 7168, 2048, 8),
+            # Qwen3.6-35B-A3B (real production shapes, representative subset)
+            (1, 256, 2048, 128, 8),
+            (16, 256, 2048, 128, 8),
+            (64, 256, 2048, 128, 8),
+            (512, 256, 2048, 128, 8),
+            (1035, 256, 2048, 128, 8),
             # Qwen3.5-397B-A17B
             (1, 512, 4096, 1024, 10),
             (4, 512, 4096, 1024, 10),
@@ -161,18 +196,19 @@ def _vllm_fused_moe_fp8_blockwise_wrapper(
     hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
 ):
     """Wrapper to call vllm fused_experts_impl with block-wise FP8."""
+    kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
     return vllm_fused_experts_impl(
         hidden_states.clone(),
         w1,
         w2,
         topk_weights,
         topk_ids,
-        inplace=False,
         activation="silu",
         use_fp8_w8a8=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=DEFAULT_BLOCK_SHAPE,
+        **kwargs,
     )
 
 
@@ -195,8 +231,10 @@ def _gems_fused_moe_fp8_blockwise_wrapper(
 
 @pytest.mark.fused_experts_impl
 @pytest.mark.skipif(
-    not (HAS_VLLM_FUSED_MOE and CUDA_AVAILABLE),
-    reason="requires vLLM and NVIDIA Hopper architecture for FP8 blockwise",
+    not (HAS_VLLM_FUSED_MOE and _SUPPORTS_FP8)
+    or flaggems_vllm.vendor_name in _FP8_BLOCKWISE_UNSUPPORTED,
+    reason="requires vLLM, native FP8 support and the block-wise quant op "
+    "(per vendor documentation and vLLM build)",
 )
 def test_fused_moe_fp8_blockwise():
     """

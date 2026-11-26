@@ -36,20 +36,26 @@ NON_TEST_FILES = {
 }
 
 ENV_SMOKE_TRIGGER_FILES = {
+    ".github/actions/setup-flaggems/action.yml",
     ".github/backend-capabilities.json",
-    ".github/workflows/basic-ci.yml",
+    ".github/backends.json",
+    ".github/configs/ci-backends.yaml",
+    ".github/workflows/backend-test.yaml",
+    ".github/workflows/unittest.yaml",
     "benchmark/conftest.py",
+    "src/flaggems_vllm/backends.yaml",
     "pyproject.toml",
     "pytest.ini",
     "tests/conftest.py",
     "tools/check_backend_env.py",
-    "tools/check_ci_pins.py",
     "tools/prepare-flaggems-ci-env.sh",
     "tools/run-multi-backend-tests.sh",
     "tools/run_ci_targets.py",
     "tools/select_backends.py",
+    "tools/select_ci_backends.py",
     "tools/select_tests.py",
     "tools/setup.sh",
+    "tools/source_env_bash.sh",
 }
 
 ENV_SMOKE_TRIGGER_PREFIXES = (
@@ -83,9 +89,175 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "conftest.py": ["tests/test_fused_matmul_reduce_scatter.py"],
+    "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
+        "tests/test_fused_matmul_reduce_scatter.py"
+    ],
+    "src/flaggems_vllm/runtime/symm_mem.py": [
+        "tests/test_fused_matmul_reduce_scatter.py",
+    ],
+    **{
+        f"src/flaggems_vllm/ops/{name}.py": [
+            "tests/test_fused_matmul_reduce_scatter.py"
+        ]
+        for name in (
+            "_fused_matmul_reduce_scatter_tle",
+            "_fused_matmul_reduce_scatter_runtime",
+        )
+    },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
+        "tests/test_gdn_w8a16.py"
+    ],
+    "src/flaggems_vllm/ops/flash_mla.py": [
+        "tests/test_flash_mla.py",
+        "tests/test_flash_mla_with_kvcache_w8a8.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_baseline.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_host.hip": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "tests/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_post.py": [
+        "tests/test_mhc_post.py",
+    ],
+    # The test does not follow the source-stem convention because the operator
+    # is named after what it does (it clamps before the Sinkhorn rounds).
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_pre.py": [
+        "tests/test_npu_mhc_pre_clamp_sinkhorn.py",
+    ],
+    "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
+        "tests/test_bmm_w8a8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_flash_attn_varlen_func.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/direct.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_flash_attn_varlen_func.py",
+    ],
+    "src/flaggems_vllm/ops/qwen4/ple_conv.py": [
+        "tests/test_ple_conv.py",
+        "tests/test_ple_conv_upstream.py",
+    ],
+    "src/flaggems_vllm/ops/qwen4/grouped_gemma_rmsnorm.py": [
+        "tests/test_grouped_gemma_rmsnorm.py",
+        "tests/test_qwen4_self_kernels.py",
+    ],
+    "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
+        "tests/test_hyperconnection.py",
+        "tests/test_qwen4_self_kernels.py",
+    ],
+    "src/flaggems_vllm/ops/qwen4/qsa.py": [
+        "tests/test_qwen4_self_kernels.py",
+        "tests/test_qsa_attention.py",
+    ],
+    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": ["tests/test_qsa_attention.py"],
+    "src/flaggems_vllm/ops/qwen4/ple_fusion.py": ["tests/test_ple_fusion.py"],
+    "src/flaggems_vllm/ops/kda_bounded.py": [
+        "tests/test_kda_bounded.py",
+        "tests/test_glm5_numerics.py",
+    ],
+    "src/flaggems_vllm/ops/kda64.py": ["tests/test_kda_bounded.py"],
+    "src/flaggems_vllm/ops/causal_conv1d.py": [
+        "tests/test_causal_conv1d.py",
+        "tests/test_glm5_numerics.py",
+    ],
+    "src/flaggems_vllm/ops/data_movement.py": [
+        "tests/test_data_movement.py",
+        "tests/test_glm_state_rows.py",
+    ],
+    "src/flaggems_vllm/ops/kpool.py": [
+        "tests/test_kpool.py",
+        "tests/test_glm5_numerics.py",
+    ],
+    "src/flaggems_vllm/ops/fp8_fp4_mqa_logits.py": [
+        "tests/test_fp8_fp4_mqa_logits.py",
+        "tests/test_indexer_scale_contract.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre.py": [
+        "tests/test_mhc_ops.py",
+        "tests/test_mhc_with_norm.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre_broadcast.py": [
+        "tests/test_mhc_pre_broadcast.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py": [
+        "tests/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/mhc_shifted_post_pre.py": [
+        "tests/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/mhc_shifted_post_pre.py": [
+        "tests/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/mhc_shifted_post_pre.py": [
+        "tests/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/ops/mhc_with_norm.py": [
+        "tests/test_mhc_with_norm.py",
+    ],
+    "src/flaggems_vllm/ops/flashmla_sparse.py": [
+        "tests/test_flash_mla_sparse_fwd.py",
+        "tests/test_glm_state_rows.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/flashmla_sparse.py": [
+        "tests/test_flash_mla_sparse_fwd.py",
+        "tests/test_glm_state_rows.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
+        "tests/test_fp8_einsum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/w8a8_block_int8_bmm.py": [
+        "tests/test_int8_einsum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/fused/attention.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    "src/flaggems_vllm/ops/attention.py": [
+        "tests/test_flash_attn_varlen_func.py",
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_scaled_dot_product_attention.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/w8a8_block_int8_bmm.py": [
+        "tests/test_int8_einsum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/attention.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_int8_bmm.py": [
+        "tests/test_int8_einsum.py",
+        "tests/test_bmm_w8a8.py",
+    ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
-    "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
+    "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
     "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
@@ -106,14 +278,160 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/FLA/wy_fast.py": [
         "tests/test_FLA/test_chunk_gated_delta_rule.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
+        "tests/test_fused_experts_impl.py",
+        "tests/test_moe_sum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
+        "tests/test_fused_experts_impl.py",
+    ],
 }
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "conftest.py": ["benchmark/test_fused_matmul_reduce_scatter.py"],
+    "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
+        "benchmark/test_fused_matmul_reduce_scatter.py"
+    ],
+    "src/flaggems_vllm/runtime/symm_mem.py": [
+        "benchmark/test_fused_matmul_reduce_scatter.py"
+    ],
+    **{
+        f"src/flaggems_vllm/ops/{name}.py": [
+            "benchmark/test_fused_matmul_reduce_scatter.py"
+        ]
+        for name in (
+            "_fused_matmul_reduce_scatter_tle",
+            "_fused_matmul_reduce_scatter_runtime",
+        )
+    },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
+        "benchmark/test_gdn_w8a16.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/gdn_w8a16_int8.py": [
+        "benchmark/test_gdn_w8a16.py"
+    ],
+    "src/flaggems_vllm/ops/flash_mla.py": [
+        "benchmark/test_flash_mla.py",
+        "benchmark/test_flash_mla_with_kvcache_w8a8.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_baseline.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_host.hip": ["benchmark/test_megamoe.py"],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "benchmark/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
+    "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
+        "benchmark/test_bmm_w8a8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+        "benchmark/test_flash_attn_varlen_func.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/direct.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+        "benchmark/test_flash_attn_varlen_func.py",
+    ],
+    "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["benchmark/test_ple_conv.py"],
+    "src/flaggems_vllm/ops/qwen4/grouped_gemma_rmsnorm.py": [
+        "benchmark/test_grouped_gemma_rmsnorm.py",
+    ],
+    "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
+        "benchmark/test_hyperconnection.py",
+        "benchmark/test_qwen4_self_kernels.py",
+    ],
+    "src/flaggems_vllm/ops/qwen4/qsa.py": [
+        "benchmark/test_qwen4_self_kernels.py",
+        "benchmark/test_qsa_attention.py",
+    ],
+    "src/flaggems_vllm/ops/qwen4/qsa_attention.py": ["benchmark/test_qsa_attention.py"],
+    "src/flaggems_vllm/ops/qwen4/ple_fusion.py": ["benchmark/test_ple_fusion.py"],
+    "src/flaggems_vllm/ops/kda_bounded.py": ["benchmark/test_kda_bounded_perf.py"],
+    "src/flaggems_vllm/ops/kda64.py": ["benchmark/test_kda_bounded_perf.py"],
+    "src/flaggems_vllm/ops/causal_conv1d.py": ["benchmark/test_glm5_ops_perf.py"],
+    "src/flaggems_vllm/ops/data_movement.py": [
+        "benchmark/test_glm5_ops_perf.py",
+        "benchmark/test_glm5_cache_perf.py",
+    ],
+    "src/flaggems_vllm/ops/kpool.py": [
+        "benchmark/test_glm5_ops_perf.py",
+        "benchmark/test_glm5_cache_perf.py",
+    ],
+    "src/flaggems_vllm/ops/paged_mqa.py": ["benchmark/test_glm5_cache_perf.py"],
+    "src/flaggems_vllm/ops/mhc_with_norm.py": ["benchmark/test_glm5_ops_perf.py"],
+    "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py": [
+        "benchmark/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/mhc_shifted_post_pre.py": [
+        "benchmark/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/mhc_shifted_post_pre.py": [
+        "benchmark/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/mhc_shifted_post_pre.py": [
+        "benchmark/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
+        "benchmark/test_fp8_einsum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/w8a8_block_int8_bmm.py": [
+        "benchmark/test_int8_einsum.py",
+    ],
+    "src/flaggems_vllm/ops/attention.py": [
+        "benchmark/test_flash_attn_varlen_func.py",
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/fused/attention.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/w8a8_block_int8_bmm.py": [
+        "benchmark/test_int8_einsum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/attention.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_int8_bmm.py": [
+        "benchmark/test_int8_einsum.py",
+        "benchmark/test_bmm_w8a8.py",
+    ],
     "src/flaggems_vllm/ops/rotary_embedding.py": [
         "benchmark/test_apply_rotary_pos_emb.py"
     ],
     "src/flaggems_vllm/ops/flashmla_sparse.py": [
+        "benchmark/test_flash_mla_sparse_fwd.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/flashmla_sparse.py": [
         "benchmark/test_flash_mla_sparse_fwd.py"
     ],
     "src/flaggems_vllm/ops/fused_moe.py": [
@@ -124,6 +442,10 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_fused_moe_int8.py",
         "benchmark/test_fused_moe_int8_w8a16.py",
         "benchmark/test_fused_moe_w8a16.py",
+    ],
+    "src/flaggems_vllm/ops/fused_marlin_moe.py": [
+        "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py",
     ],
     "src/flaggems_vllm/ops/sparse_attention.py": [
         "benchmark/test_sparse_attention.py",
@@ -148,6 +470,22 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/FLA/wy_fast.py": [
         "benchmark/test_FLA/test_chunk_gated_delta_rule_perf.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/fused/moe_sum.py": [
+        "benchmark/test_fused_moe.py",
+        "benchmark/test_moe_sum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
+        "benchmark/test_fused_moe.py",
     ],
 }
 
@@ -223,7 +561,7 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path
+        "/ops/" in path or "/fused/" in path or "/FLA/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []
@@ -250,7 +588,7 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path
+        "/ops/" in path or "/fused/" in path or "/FLA/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []
@@ -267,6 +605,31 @@ def triggers_env_smoke_tests(path: str) -> bool:
     return path in ENV_SMOKE_TRIGGER_FILES or path.startswith(
         ENV_SMOKE_TRIGGER_PREFIXES
     )
+
+
+def _is_operator_implementation(path: str) -> bool:
+    """Return True if *path* looks like an operator implementation file.
+
+    Only operator files (under ops/ or vendor fused/ops directories) should
+    trigger the fail-closed full-test-suite behaviour when they lack a test
+    mapping.  Infrastructure files — __init__.py, utils/, runtime plumbing,
+    testing helpers — are covered by the smoke lane and should not escalate.
+    """
+    # __init__.py files are package markers, never standalone operators.
+    if path.endswith("/__init__.py"):
+        return False
+
+    # Shared operator implementations.
+    if path.startswith("src/flaggems_vllm/ops/"):
+        return True
+
+    # Vendor-specific operator / fused-kernel implementations.
+    if path.startswith("src/flaggems_vllm/runtime/backend/_") and (
+        "/ops/" in path or "/fused/" in path or "/FLA/" in path
+    ):
+        return True
+
+    return False
 
 
 def select_targets(
@@ -308,10 +671,16 @@ def select_targets(
         # Changed Python implementation code without a known test mapping must
         # fail closed. Running all tests on the trusted NVIDIA lane is safer
         # than silently reporting success without testing the changed code.
+        #
+        # However, infrastructure files (runtime plumbing, utils, __init__.py)
+        # are already covered by the ENV_SMOKE_TRIGGER_PREFIXES mechanism or
+        # are not operator implementations — they should not escalate to a full
+        # test suite on every change.
         if (
             path.startswith("src/flaggems_vllm/")
             and path.endswith(".py")
             and not source_tests
+            and _is_operator_implementation(path)
         ):
             full_tests_required = True
 

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import dataclasses
+import inspect
+import math
 import random
 from typing import List, Optional, Tuple
 
@@ -23,17 +25,41 @@ import flaggems_vllm
 
 random.seed(42)
 
-try:
-    from vllm.v1.attention.ops.flashmla import (
-        flash_mla_sparse_fwd as vllm_flash_mla_sparse_fwd,
-    )
 
-    HAS_VLLM_FLASHMLA_SPARSE = True
-except ImportError:
-    HAS_VLLM_FLASHMLA_SPARSE = False
-    print(
-        "vLLM not installed, the native pytorch implementation of FlashMLA for comparison"
-    )
+def _get_vllm_flashmla_sparse_reference():
+    """Return vLLM's sparse FlashMLA op only when its extension is usable."""
+    try:
+        from vllm.v1.attention.ops import flashmla
+    except Exception as error:
+        return None, f"vLLM FlashMLA could not be imported: {error}"
+
+    support_check = getattr(flashmla, "is_flashmla_sparse_supported", None)
+    if not callable(support_check):
+        return None, "vLLM does not expose is_flashmla_sparse_supported()"
+
+    try:
+        support = support_check()
+    except Exception as error:
+        return None, f"vLLM FlashMLA capability check failed: {error}"
+
+    if isinstance(support, tuple):
+        supported, reason = support
+    else:
+        supported, reason = bool(support), None
+    if not supported:
+        return None, reason or "vLLM sparse FlashMLA is not supported"
+
+    reference = getattr(flashmla, "flash_mla_sparse_fwd", None)
+    if not callable(reference):
+        return None, "vLLM sparse FlashMLA reference is not callable"
+    return reference, None
+
+
+vllm_flash_mla_sparse_fwd, VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON = (
+    _get_vllm_flashmla_sparse_reference()
+)
+HAS_VLLM_FLASHMLA_SPARSE = vllm_flash_mla_sparse_fwd is not None
+if not HAS_VLLM_FLASHMLA_SPARSE:
     torch.set_float32_matmul_precision("high")
 
 
@@ -206,6 +232,26 @@ class FlashmlaSparseTestKit:
             ]
             for have_attn_sink in [True, False]
             for have_topk_length in [True, False]
+        ]
+        # DeepSeek-V4-Flash prefill: TOPK split, small head blocks, 8 and 16 warps
+        cases += [
+            Flashmla_Sparse_Test_Param(
+                s_q,
+                s_kv,
+                topk,
+                h_q=64,
+                d_qk=512,
+                have_attn_sink=True,
+                have_topk_length=have_topk_length,
+            )
+            for s_q in [4, 9, 16, 40]
+            for s_kv, topk in [(592, 128), (2048, 640), (16384, 8320)]
+            for have_topk_length in [True, False]
+        ]
+        # GLM-5.2 prefill, most frequent calls (no attn_sink / topk_length)
+        cases += [
+            Flashmla_Sparse_Test_Param(s_q, 361344, 2048, h_q=64, d_qk=576)
+            for s_q in [64, 449]
         ]
         return cases
 
@@ -431,3 +477,77 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
     torch.testing.assert_close(
         your_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
     )
+
+
+@pytest.mark.flash_mla_sparse_fwd
+def test_flash_mla_sparse_large_kv_offset(monkeypatch):
+    if flaggems_vllm.vendor_name != "nvidia" or not torch.cuda.is_available():
+        pytest.skip("Requires an NVIDIA CUDA device")
+    device = torch.device(flaggems_vllm.device)
+    if torch.cuda.get_device_capability(device)[0] < 8:
+        pytest.skip("Requires native BF16 support")
+    if torch.cuda.mem_get_info(device)[0] < 5 * 1024**3:
+        pytest.skip("Requires 5 GiB of free device memory")
+
+    monkeypatch.setenv("FLAGGEMS_FLASHMLA_SPARSE_TLE", "0")
+    width = 576
+    topk = 128
+    high_row = torch.iinfo(torch.int32).max // width + 1
+    kv = torch.empty((high_row + 1, 1, width), device=device, dtype=torch.bfloat16)
+    q = torch.zeros((2, 64, width), device=device, dtype=torch.bfloat16)
+    indices = torch.empty((2, 1, topk), device=device, dtype=torch.int32)
+
+    # Only the selected rows need to be initialized. Repeated indices make
+    # the output equal to the selected V row and give an analytical LSE.
+    q[..., -1] = 1
+    kv[0].fill_(-0.5)
+    kv[0, 0, -1] = 1
+    kv[high_row].fill_(0.25)
+    kv[high_row, 0, -1] = 2
+    indices[0].fill_(0)
+    indices[1].fill_(high_row)
+
+    def check(results, swapped=False):
+        out, max_logits, lse = results
+        values = (0.25, -0.5) if swapped else (-0.5, 0.25)
+        maxima = (1.0, 0.5) if swapped else (0.5, 1.0)
+        for row, (value, maximum) in enumerate(zip(values, maxima)):
+            torch.testing.assert_close(out[row], torch.full_like(out[row], value))
+            torch.testing.assert_close(
+                max_logits[row], torch.full_like(max_logits[row], maximum)
+            )
+            torch.testing.assert_close(
+                lse[row], torch.full_like(lse[row], maximum + math.log(topk))
+            )
+
+    op = flaggems_vllm.flash_mla_sparse_fwd
+    check(op(q, kv, indices, 0.5))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = op(q, kv, indices, 0.5)
+    for swapped in (False, True, False):
+        indices[0].fill_(high_row if swapped else 0)
+        indices[1].fill_(0 if swapped else high_row)
+        for result in outputs:
+            result.fill_(float("nan"))
+        graph.replay()
+        check(outputs, swapped)
+
+
+@pytest.mark.flash_mla_sparse_fwd
+def test_flash_mla_sparse_vendor_export_and_abi():
+    from flaggems_vllm.ops import flashmla_sparse as generic
+
+    op = flaggems_vllm.flash_mla_sparse_fwd
+    assert inspect.signature(op) == inspect.signature(generic.flash_mla_sparse_fwd)
+    if flaggems_vllm.vendor_name == "thead":
+        from flaggems_vllm.runtime.backend._thead.fused import flashmla_sparse
+
+        assert op is flashmla_sparse.flash_mla_sparse_fwd
+        # no query tokens: empty outputs, no launch
+        q = torch.empty((0, 64, 512), dtype=torch.bfloat16, device=flaggems_vllm.device)
+        kv = torch.empty((16, 1, 512), dtype=torch.bfloat16, device=q.device)
+        indices = torch.empty((0, 1, 128), dtype=torch.int32, device=q.device)
+        out, max_logits, lse = op(q, kv, indices, 512**-0.5)
+        assert out.shape == (0, 64, 512) and out.dtype == torch.bfloat16
+        assert max_logits.shape == (0, 64) and lse.shape == (0, 64)

@@ -18,11 +18,26 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.utils import libentry, libtuner
 
 
 def _default_scale_slots(nope_dim: int) -> int:
     return triton.cdiv(nope_dim, 64) + (1 if nope_dim % 64 == 0 else 0)
+
+
+def _stat_total(gather_lens, num_reqs: int) -> int:
+    """Total tokens to gather: the tuner key for the work size."""
+    return num_reqs if gather_lens is None else int(gather_lens.shape[-1]) * num_reqs
+
+
+def _stat_max(gather_lens) -> int:
+    """Largest per-request gather length: the tuner key for the parallelism shape."""
+    return 0 if gather_lens is None else int(gather_lens.shape[-1])
+
+
+_DEFAULT_TUNE_CONFIGS = [triton.Config({"num_workers": 128})]
 
 
 def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
@@ -35,6 +50,13 @@ def _as_cache_2d(k_cache: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"k_cache must be 2D or 3D, got shape={tuple(k_cache.shape)}")
 
 
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("dequantize_and_gather_k_cache")
+    or _DEFAULT_TUNE_CONFIGS,
+    key=["num_tokens", "max_gather_len"],
+    strategy=["log", "log"],
+)
 @triton.jit
 def _dequantize_and_gather_k_cache_kernel(
     out_ptr,
@@ -55,7 +77,10 @@ def _dequantize_and_gather_k_cache_kernel(
     cache_block_stride: tl.constexpr,
     output_dim: tl.constexpr,
     num_workers: tl.constexpr,
+    n_quant_blocks: tl.constexpr,
     HAVE_GATHER_LENS: tl.constexpr,
+    num_tokens: tl.constexpr,
+    max_gather_len: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     worker_idx = tl.program_id(1)
@@ -82,10 +107,29 @@ def _dequantize_and_gather_k_cache_kernel(
         )
         out_row = out_ptr + req_idx * out_stride0 + (offset + local_i) * out_stride1
 
-        for qblock in tl.static_range(0, scale_slots):
+        if nope_dim % quant_block == 0:
+            for qblock in tl.static_range(0, n_quant_blocks):
+                qoffs = qblock * quant_block + tl.arange(0, quant_block)
+                x_u8 = tl.load(token_data + qoffs)
+                x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                encoded = tl.load(scale_base + qblock)
+                scale = tl.exp2(encoded.to(tl.float32) - 127.0)
+                x = x_fp8 * scale
+                tl.store(out_row + qoffs, x.to(tl.bfloat16))
+        else:
+            for qblock in tl.static_range(0, n_quant_blocks - 1):
+                qoffs = qblock * quant_block + tl.arange(0, quant_block)
+                x_u8 = tl.load(token_data + qoffs)
+                x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                encoded = tl.load(scale_base + qblock)
+                scale = tl.exp2(encoded.to(tl.float32) - 127.0)
+                x = x_fp8 * scale
+                tl.store(out_row + qoffs, x.to(tl.bfloat16))
+
+            qblock = n_quant_blocks - 1
             qoffs = qblock * quant_block + tl.arange(0, quant_block)
             qmask = qoffs < nope_dim
-            x_u8 = tl.load(token_data + qoffs, mask=qmask, other=0).to(tl.uint8)
+            x_u8 = tl.load(token_data + qoffs, mask=qmask, other=0)
             x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
             encoded = tl.load(scale_base + qblock)
             scale = tl.exp2(encoded.to(tl.float32) - 127.0)
@@ -93,8 +137,8 @@ def _dequantize_and_gather_k_cache_kernel(
             tl.store(out_row + qoffs, x.to(tl.bfloat16), mask=qmask)
 
         bf16_ptr = (token_data + nope_dim).to(tl.pointer_type(tl.bfloat16))
-        for rblock in tl.static_range(0, rope_dim, 16):
-            roffs = rblock + tl.arange(0, 16)
+        for rblock in tl.static_range(0, rope_dim, 64):
+            roffs = rblock + tl.arange(0, 64)
             rmask = roffs < rope_dim
             vals = tl.load(bf16_ptr + roffs, mask=rmask, other=0.0)
             tl.store(out_row + nope_dim + roffs, vals, mask=rmask)
@@ -120,14 +164,16 @@ def dequantize_and_gather_k_cache(
         nope_dim = output_dim - rope_dim
     if scale_slots is None:
         scale_slots = _default_scale_slots(nope_dim)
-    assert nope_dim + rope_dim <= output_dim
 
+    n_quant_blocks = triton.cdiv(nope_dim, 64)
+    assert nope_dim + rope_dim <= output_dim
     k_cache_2d = _as_cache_2d(k_cache)
     token_data_size = nope_dim + rope_dim * 2
     num_reqs = seq_lens.shape[0]
-    num_workers = 128
+    # num_workers is tuner-owned, so resolve the grid from its meta-parameters.
+    grid = lambda meta: (num_reqs, meta["num_workers"])
     with torch_device_fn.device(out.device):
-        _dequantize_and_gather_k_cache_kernel[(num_reqs, num_workers)](
+        _dequantize_and_gather_k_cache_kernel[grid](
             out,
             out.stride(0),
             out.stride(1),
@@ -145,8 +191,10 @@ def dequantize_and_gather_k_cache(
             token_data_size=token_data_size,
             cache_block_stride=k_cache_2d.stride(0),
             output_dim=output_dim,
-            num_workers=num_workers,
+            n_quant_blocks=n_quant_blocks,
             HAVE_GATHER_LENS=gather_lens is not None,
+            num_tokens=_stat_total(gather_lens, num_reqs),
+            max_gather_len=_stat_max(gather_lens),
         )
 
 

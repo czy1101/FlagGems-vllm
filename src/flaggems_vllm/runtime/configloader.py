@@ -91,6 +91,8 @@ class ConfigLoader(object):
             "num_stages": current_config["num_stages"],
             "num_ctas": current_config["num_ctas"],
         }
+        if "maxnreg" in single_config:
+            kwargs["maxnreg"] = single_config["maxnreg"]
         if (
             self.device.vendor_name == "hygon"
             and "num_ldmatrixes" in inspect.signature(triton.Config).parameters
@@ -262,7 +264,13 @@ class ConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name == "fused_marlin_moe_mxfp4":
+        if op_name in (
+            "fused_marlin_moe_w4a16_int4",
+            "fused_marlin_moe_w4a16_int4_gemm_silu",
+            "fused_marlin_moe_w4a16_mxfp4",
+            "fused_marlin_moe_w4a16_mxfp4_gemm_silu",
+        ):
+            maxnreg_values = ranges.get("maxnreg", [None])
             return [
                 triton.Config(
                     {
@@ -271,12 +279,14 @@ class ConfigLoader(object):
                     },
                     num_stages=s,
                     num_warps=w,
+                    maxnreg=maxnreg,
                     pre_hook=pre_hook,
                 )
                 for block_size_n in ranges["BLOCK_SIZE_N"]
                 for group_size_m in ranges["GROUP_SIZE_M"]
                 for s in ranges["s"]
                 for w in ranges["w"]
+                for maxnreg in maxnreg_values
             ]
 
         if op_name == "w8a8_block_fp8_bmm":
@@ -292,7 +302,7 @@ class ConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name == "w8a8_block_fp8_general":
+        if op_name in ("w8a8_block_fp8_general", "w8a8_block_fp8_bmm_general"):
             return [
                 triton.Config(
                     {
@@ -350,7 +360,7 @@ class ConfigLoader(object):
                 for w in ranges["w"]
             ]
 
-        if op_name == "w8a8_block_fp8_general_splitk":
+        if op_name in ("w8a8_block_fp8_general_splitk", "w8a8_block_fp8_bmm_splitk"):
             return [
                 triton.Config(
                     {
@@ -388,6 +398,154 @@ class ConfigLoader(object):
                 for block_n in ranges["BLOCK_N"]
                 for block_k in ranges["BLOCK_K"]
                 for split_k in ranges["SPLIT_K"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "w8a8_block_fp8_matmul":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "BLOCK_K": block_k,
+                        "GROUP_M": group_m,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for group_m in ranges["GROUP_M"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "w8a8_block_fp8_swap_ab":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "BLOCK_K": block_k,
+                        "GROUP_M": group_m,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for group_m in ranges["GROUP_M"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "w8a8_block_fp8_swap_ab_splitk":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "BLOCK_K": block_k,
+                        "GROUP_M": group_m,
+                        "SPLIT_K": split_k,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for group_m in ranges["GROUP_M"]
+                for split_k in ranges["SPLIT_K"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "w8a8_block_fp8_short_k256":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name.startswith("w8a8_block_int8_") and (
+            "SCHEDULE" in ranges or "VECTOR" in ranges
+        ):
+            meta_map = {k: k for k in ranges if k not in ("s", "w")}
+            param_map = {"META": meta_map, "num_stages": "s", "num_warps": "w"}
+            configs = self.to_gen_config({**ranges, "param_map": param_map})
+            for config in configs:
+                config.pre_hook = pre_hook
+            return configs
+
+        if op_name in ("w8a8_block_int8_matmul", "w8a8_block_int8_swap"):
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "GROUP_M": group_m,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for group_m in ranges["GROUP_M"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "w8a8_block_int8_gemv":
+            return [
+                triton.Config(
+                    {"BLOCK_N": block_n, "BLOCK_K": block_k},
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_n in ranges["BLOCK_N"]
+                for block_k in ranges["BLOCK_K"]
+                for s in ranges["s"]
+                for w in ranges["w"]
+            ]
+
+        if op_name == "w8a8_block_int8_splitk":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": block_m,
+                        "BLOCK_N": block_n,
+                        "GROUP_M": group_m,
+                        "SPLITS": splits,
+                        "SWAP": swap,
+                    },
+                    num_stages=s,
+                    num_warps=w,
+                    pre_hook=pre_hook,
+                )
+                for block_m in ranges["BLOCK_M"]
+                for block_n in ranges["BLOCK_N"]
+                for group_m in ranges["GROUP_M"]
+                for splits in ranges["SPLITS"]
+                for swap in ranges["SWAP"]
                 for s in ranges["s"]
                 for w in ranges["w"]
             ]
@@ -467,9 +625,29 @@ class ConfigLoader(object):
                 "bmm", expand_yaml_path=self._get_expand_config_path("bmm")
             ),
             "bmm_sqmma": self._build_single_expand_spec("bmm_sqmma"),
-            "fused_marlin_moe_mxfp4": self._build_single_expand_spec(
-                "fused_marlin_moe_mxfp4",
-                expand_yaml_path=self._get_expand_config_path("fused_marlin_moe_mxfp4"),
+            "fused_marlin_moe_w4a16_int4": self._build_single_expand_spec(
+                "fused_marlin_moe_w4a16_int4",
+                expand_yaml_path=self._get_expand_config_path(
+                    "fused_marlin_moe_w4a16_int4"
+                ),
+            ),
+            "fused_marlin_moe_w4a16_int4_gemm_silu": self._build_single_expand_spec(
+                "fused_marlin_moe_w4a16_int4_gemm_silu",
+                expand_yaml_path=self._get_expand_config_path(
+                    "fused_marlin_moe_w4a16_int4_gemm_silu"
+                ),
+            ),
+            "fused_marlin_moe_w4a16_mxfp4": self._build_single_expand_spec(
+                "fused_marlin_moe_w4a16_mxfp4",
+                expand_yaml_path=self._get_expand_config_path(
+                    "fused_marlin_moe_w4a16_mxfp4"
+                ),
+            ),
+            "fused_marlin_moe_w4a16_mxfp4_gemm_silu": self._build_single_expand_spec(
+                "fused_marlin_moe_w4a16_mxfp4_gemm_silu",
+                expand_yaml_path=self._get_expand_config_path(
+                    "fused_marlin_moe_w4a16_mxfp4_gemm_silu"
+                ),
             ),
             "gemv": self._build_single_expand_spec("gemv"),
             "mm": self._build_single_expand_spec(
@@ -497,6 +675,59 @@ class ConfigLoader(object):
             "w8a8_block_fp8_bmm": self._build_single_expand_spec(
                 "w8a8_block_fp8_bmm",
                 expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_bmm"),
+            ),
+            "w8a8_block_fp8_bmm_general": self._build_single_expand_spec(
+                "w8a8_block_fp8_bmm_general",
+                expand_yaml_path=self._get_expand_config_path(
+                    "w8a8_block_fp8_bmm_general"
+                ),
+            ),
+            "w8a8_block_fp8_bmm_splitk": self._build_single_expand_spec(
+                "w8a8_block_fp8_bmm_splitk",
+                expand_yaml_path=self._get_expand_config_path(
+                    "w8a8_block_fp8_bmm_splitk"
+                ),
+            ),
+            "w8a8_block_fp8_matmul": self._build_single_expand_spec(
+                "w8a8_block_fp8_matmul",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_matmul"),
+                yaml_op_name="w8a8_block_fp8_general",
+            ),
+            "w8a8_block_fp8_swap_ab": self._build_single_expand_spec(
+                "w8a8_block_fp8_swap_ab",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_matmul"),
+            ),
+            "w8a8_block_fp8_swap_ab_splitk": self._build_single_expand_spec(
+                "w8a8_block_fp8_swap_ab_splitk",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_matmul"),
+            ),
+            "w8a8_block_fp8_short_k256": self._build_single_expand_spec(
+                "w8a8_block_fp8_short_k256",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_fp8_matmul"),
+            ),
+            "w8a8_block_int8_matmul": self._build_single_expand_spec(
+                "w8a8_block_int8_matmul",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_int8_matmul"),
+            ),
+            "w8a8_block_int8_swap": self._build_single_expand_spec(
+                "w8a8_block_int8_swap",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_int8_matmul"),
+            ),
+            "w8a8_block_int8_gemv": self._build_single_expand_spec(
+                "w8a8_block_int8_gemv",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_int8_matmul"),
+            ),
+            "w8a8_block_int8_general": self._build_single_expand_spec(
+                "w8a8_block_int8_general",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_int8_matmul"),
+            ),
+            "w8a8_block_int8_gemv_block": self._build_single_expand_spec(
+                "w8a8_block_int8_gemv_block",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_int8_matmul"),
+            ),
+            "w8a8_block_int8_splitk": self._build_single_expand_spec(
+                "w8a8_block_int8_splitk",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_int8_matmul"),
             ),
             "mm_splitk": self._build_single_expand_spec("mm_splitk"),
             "sparse_attention": self._build_single_expand_spec("sparse_attention"),
@@ -553,14 +784,14 @@ class ConfigLoader(object):
             current_step = cur_state.get("current_step")
 
             if current_step == final_step:
-                all_configs.append(
-                    triton.Config(
-                        cur_config["META"],
-                        num_warps=cur_config["num_warps"],
-                        num_stages=cur_config["num_stages"],
-                        num_ctas=cur_config["num_ctas"],
-                    )
-                )
+                triton_kwargs = {
+                    "num_warps": cur_config["num_warps"],
+                    "num_stages": cur_config["num_stages"],
+                    "num_ctas": cur_config["num_ctas"],
+                }
+                if "maxnreg" in cur_config:
+                    triton_kwargs["maxnreg"] = cur_config["maxnreg"]
+                all_configs.append(triton.Config(cur_config["META"], **triton_kwargs))
             else:
                 cur_entry = iteration_plan[current_step]
                 cur_key = cur_entry["key"]
@@ -658,6 +889,12 @@ class ConfigLoader(object):
                 ranges[mapped_key.upper()] = gen_config[mapped_key]
             ranges["s"] = gen_config[param_map.get("num_stages")]
             ranges["w"] = gen_config[param_map.get("num_warps")]
+
+            extra_config_keys = ["maxnreg"]
+            for key in extra_config_keys:
+                source = param_map.get(key)
+                if source and source in gen_config:
+                    ranges[source] = gen_config[source]
 
             return {
                 "ranges": ranges,

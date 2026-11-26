@@ -17,16 +17,181 @@ import torch
 
 import flaggems_vllm
 
-from . import base, utils
+from . import base
 
-try:
-    from vllm._custom_ops import grouped_topk as vllm_grouped_topk
 
-    HAS_VLLM = True
-except (ImportError, AttributeError):
-    HAS_VLLM = False
+def torch_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    """
+    Adapted from vLLM: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py.
+    Ignore the non-stablility of torch.topk in benchmark test.
+    """
+    scores = scores.float()
+    if scoring_func == 1:
+        scores = scores.sigmoid()
+
+    num_token = scores.size(0)
+    original_scores = scores
+    scores = scores + bias.unsqueeze(0)
+    group_scores = (
+        scores.view(num_token, num_expert_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+    )
+
+    use_sorted = True
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
+        1
+    ]  # [n, top_k_group]
+    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_token, num_expert_group, scores.size(-1) // num_expert_group)
+        .reshape(num_token, -1)
+    )  # [n, e]
+    tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
+
+    if bias is not None:
+        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
+        # Use original unbiased scores for the routing weights
+        topk_weights = original_scores.gather(1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(
+            tmp_scores, k=topk, dim=-1, sorted=use_sorted
+        )
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def aiter_biased_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    num_tokens = scores.size(0)
+    topk_weights = torch.empty(
+        (num_tokens, topk), dtype=torch.float32, device=scores.device
+    )
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
+    moe_fused_gate(
+        scores.float(),
+        bias.float(),
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        topk=topk,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    return topk_weights, topk_ids
+
+
+def mthreads_grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    num_fused_shared_experts = 0
+    apply_routed_scaling_factor_on_output = routed_scaling_factor != 1.0
+    topk_weights, topk_ids = moe_fused_gate(
+        scores.float(),
+        bias.float(),
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts,
+        routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+        renormalize,
+        apply_routed_scaling_factor_on_output,
+    )
+    return topk_weights, topk_ids
+
+
+def ascend_moe_gating_top_k(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+):
+    norm_type = 1  # 0: softmax; 1: sigmoid
+    renorm = int(renormalize)
+    topk_weights, topk_ids, _out = torch.ops._C_ascend.moe_gating_top_k(
+        scores.float(),
+        k=topk,
+        k_group=topk_group,
+        group_count=num_expert_group,
+        group_select_mode=1,
+        renorm=renorm,
+        norm_type=norm_type,
+        out_flag=False,
+        routed_scaling_factor=routed_scaling_factor,
+        eps=1e-20,
+        bias_opt=bias.float(),
+    )
+    return topk_weights, topk_ids.to(torch.int32)
+
 
 vendor_name = flaggems_vllm.vendor_name
+USE_AITER = False
+USE_MATE = False
+USE_C_ASCEND = False
+
+try:
+    if vendor_name == "hygon":
+        from aiter import moe_fused_gate  # noqa: F401
+
+        ref_grouped_topk = aiter_biased_grouped_topk
+        USE_AITER = True
+    elif vendor_name == "mthreads":
+        from mate import moe_fused_gate  # noqa: F401
+
+        ref_grouped_topk = mthreads_grouped_topk
+        USE_MATE = True
+    elif vendor_name == "ascend":
+        from vllm_ascend.utils import enable_custom_op
+
+        enable_custom_op()
+        if hasattr(torch.ops._C_ascend, "moe_gating_top_k"):
+            ref_grouped_topk = ascend_moe_gating_top_k
+        else:
+            ref_grouped_topk = torch_grouped_topk
+        USE_C_ASCEND = True
+    else:
+        import vllm._custom_ops  # noqa: F401
+
+        if hasattr(torch.ops._moe_C, "grouped_topk"):
+            ref_grouped_topk = torch.ops._moe_C.grouped_topk
+        else:
+            ref_grouped_topk = torch_grouped_topk
+except (ImportError, AttributeError):
+    ref_grouped_topk = torch_grouped_topk
 
 
 class GroupedTopKBenchmark(base.Benchmark):
@@ -45,23 +210,16 @@ class GroupedTopKBenchmark(base.Benchmark):
         self.scoring_func = scoring_func
 
     def set_shapes(self, shape_file_path=None):
-        grouped_topk_configs = [
-            (1, 64, 8, 2, 8),
-            (8, 64, 8, 2, 8),
-            (32, 64, 8, 2, 8),
-            (64, 64, 8, 2, 8),
-            (128, 64, 8, 2, 8),
-            (256, 64, 8, 2, 8),
-            (32, 128, 8, 2, 8),
-            (64, 128, 8, 2, 8),
-            (128, 128, 8, 2, 8),
-            (64, 64, 4, 2, 4),
-            (64, 128, 16, 2, 8),
-            (512, 64, 8, 2, 8),
-            (1024, 64, 8, 2, 8),
-            (2048, 64, 8, 2, 8),
+        # num_tokens, num_experts, n_group, topk_group, topk
+        self.shapes = [
+            # Deepseek-3.2
+            (num_tokens, 256, 8, 4, 8)
+            for num_tokens in [1, 8, 32, 64, 128, 256, 496, 512, 16384]
+        ] + [
+            # GLM-5.2
+            (num_tokens, 256, 1, 1, 8)
+            for num_tokens in [1, 8, 64, 193, 449, 16384]
         ]
-        self.shapes = grouped_topk_configs
 
     def get_input_iter(self, dtype):
         for config in self.shapes:
@@ -71,7 +229,7 @@ class GroupedTopKBenchmark(base.Benchmark):
         num_tokens, num_experts, n_group, topk_group, topk = config
 
         scores = torch.randn(num_tokens, num_experts, device=device, dtype=dtype)
-        bias = torch.randn(num_experts, device=device, dtype=dtype)
+        bias = torch.randn(num_experts, device=device, dtype=torch.float32)
 
         yield (
             scores,
@@ -86,26 +244,24 @@ class GroupedTopKBenchmark(base.Benchmark):
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not HAS_VLLM, reason="Skipped due to missing vLLM grouped_topk")
 @pytest.mark.skipif(
-    utils.SkipVersion("vllm", "<0.9"),
-    reason="The version prior to 0.9 does not include the grouped_topk kernel.",
+    USE_AITER, reason="scoring_func == 0 is not supported by moe_fused_gate in aiter"
 )
 @pytest.mark.skipif(
-    utils.SkipVersion("torch", "<2.7"),
-    reason="The version prior to 2.7 is not compatible with VLLM.",
+    USE_MATE, reason="scoring_func == 0 is not supported by moe_fused_gate in mate"
 )
-@pytest.mark.skipif(vendor_name == "metax", reason="#2891: Not working")
+@pytest.mark.skipif(
+    USE_C_ASCEND,
+    reason="scoring_func == 0 is not supported by moe_gating_top_k in vllm-ascend",
+)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "mthreads", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "hygon", reason="#2891: RuntimeError")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
 def test_grouped_topk_no_renorm():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
-        torch_op=vllm_grouped_topk,
-        dtypes=[torch.float32, torch.bfloat16],
+        torch_op=ref_grouped_topk,
+        dtypes=[torch.bfloat16],
         renormalize=False,
         scoring_func=0,
     )
@@ -115,26 +271,24 @@ def test_grouped_topk_no_renorm():
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not HAS_VLLM, reason="Skipped due to missing vLLM grouped_topk")
 @pytest.mark.skipif(
-    utils.SkipVersion("vllm", "<0.9"),
-    reason="The version prior to 0.9 does not include the grouped_topk kernel.",
+    USE_AITER, reason="scoring_func == 0 is not supported by moe_fused_gate in aiter"
 )
 @pytest.mark.skipif(
-    utils.SkipVersion("torch", "<2.7"),
-    reason="The version prior to 2.7 is not compatible with VLLM.",
+    USE_MATE, reason="scoring_func == 0 is not supported by moe_fused_gate in mate"
 )
-@pytest.mark.skipif(vendor_name == "metax", reason="#2891: Not working")
+@pytest.mark.skipif(
+    USE_C_ASCEND,
+    reason="scoring_func == 0 is not supported by moe_gating_top_k in vllm-ascend",
+)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working ")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "mthreads", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "hygon", reason="#2891: RuntimeError")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
 def test_grouped_topk_score_0():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
-        torch_op=vllm_grouped_topk,
-        dtypes=[torch.float32, torch.bfloat16],
+        torch_op=ref_grouped_topk,
+        dtypes=[torch.bfloat16],
         renormalize=True,
         scoring_func=0,
     )
@@ -144,29 +298,88 @@ def test_grouped_topk_score_0():
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not HAS_VLLM, reason="Skipped due to missing vLLM grouped_topk")
-@pytest.mark.skipif(
-    utils.SkipVersion("vllm", "<0.9"),
-    reason="The version prior to 0.9 does not include the grouped_topk kernel.",
-)
-@pytest.mark.skipif(
-    utils.SkipVersion("torch", "<2.7"),
-    reason="The version prior to 2.7 is not compatible with VLLM.",
-)
-@pytest.mark.skipif(vendor_name == "metax", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "mthreads", reason="#2891: Not working")
-@pytest.mark.skipif(vendor_name == "hygon", reason="#2891: RuntimeError")
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "cambricon", reason="#2891: TypeError")
 def test_grouped_topk_score_1():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
-        torch_op=vllm_grouped_topk,
-        dtypes=[torch.float32, torch.bfloat16],
+        torch_op=ref_grouped_topk,
+        dtypes=[torch.bfloat16],
         renormalize=True,
         scoring_func=1,
     )
 
+    bench.set_gems(flaggems_vllm.grouped_topk)
+    bench.run()
+
+
+def _baseline_grouped_topk_cuda9(*args):
+    return torch.ops._moe_C.grouped_topk(*args)
+
+
+class GroupedTopKPaddingBenchmark(GroupedTopKBenchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (rows, experts, groups, keep, topk)
+            for rows in (1, 8, 32, 128, 257)
+            for experts, groups, keep, topk in ((512, 1, 1, 16), (256, 8, 4, 8))
+        ]
+
+    def grouped_topk_input_fn(self, config, dtype, device):
+        rows = config[0]
+        for args in super().grouped_topk_input_fn(config, dtype, device):
+            for padding_count in sorted(
+                {0, rows // 4, rows // 2, (3 * rows) // 4, rows}
+            ):
+                mask = torch.arange(rows, device=device) < padding_count
+                yield (*args, mask)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(
+    vendor_name != "nvidia", reason="padding is a CUDA routing contract"
+)
+def test_grouped_topk_padding_benchmark():
+    if not hasattr(torch.ops._moe_C, "grouped_topk"):
+        pytest.skip("native CUDA grouped_topk required for the measured baseline")
+    op = torch.ops._moe_C.grouped_topk.default
+    if not any(a.name == "is_padding" for a in op._schema.arguments):
+        pytest.skip("native CUDA grouped_topk padding argument required")
+    bench = GroupedTopKPaddingBenchmark(
+        op_name="grouped_topk_padding",
+        torch_op=_baseline_grouped_topk_cuda9,
+        dtypes=[torch.float32, torch.bfloat16],
+        renormalize=True,
+        routed_scaling_factor=3.998,
+        scoring_func=1,
+    )
+    bench.set_gems(flaggems_vllm.grouped_topk)
+    bench.run()
+
+
+class GroupedTopKGenericBenchmark(GroupedTopKBenchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (rows, experts, groups, keep, topk)
+            for rows in (1, 64, 4096)
+            for experts, groups, keep, topk in (
+                (384, 3, 2, 4),
+                (512, 8, 4, 8),
+                (1024, 8, 4, 16),
+            )
+        ]
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA generic routing sweep")
+def test_grouped_topk_generic_sigmoid_benchmark():
+    bench = GroupedTopKGenericBenchmark(
+        op_name="grouped_topk_generic",
+        torch_op=ref_grouped_topk,
+        dtypes=[torch.bfloat16],
+        renormalize=True,
+        scoring_func=1,
+    )
     bench.set_gems(flaggems_vllm.grouped_topk)
     bench.run()

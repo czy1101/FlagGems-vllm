@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import importlib
 import math
 import os
 import time
@@ -34,6 +35,8 @@ from .consts import (
     BenchmarkResult,
     OperationAttribute,
     check_metric_dependencies,
+    lookup_base_record_ex,
+    lookup_scaling_factor,
     model_shapes,
 )
 
@@ -52,6 +55,104 @@ else:
         torch_backend_device.matmul.allow_tf32 = False
     except Exception:
         pass
+
+
+def import_vllm_benchmark_baseline(module_name):
+    """Skip a benchmark when its vLLM baseline module is unavailable."""
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name and (
+            exc.name == module_name or module_name.startswith(f"{exc.name}.")
+        ):
+            pytest.skip(f"installed vLLM does not provide {module_name}")
+        raise
+
+
+def get_iter_count(fn):
+    if Config.mode == consts.BenchMode.OPERATOR:
+        torch_device_fn.synchronize()
+        start = time.time()
+        for _ in range(5):
+            fn()
+        torch_device_fn.synchronize()
+        end = time.time()
+        latency = (end - start) / 5 * 1000
+    elif Config.mode == consts.BenchMode.WRAPPER:
+        torch_device_fn.synchronize()
+        start = time.time()
+        for _ in range(5):
+            fn()
+        end = time.time()
+        torch_device_fn.synchronize()
+        latency = (end - start) / 5 * 1000
+    else:
+        raise ValueError("Unsupport Benchmark Mode.")
+    return max(1, int(Config.warm_up / latency)), max(
+        1, int(Config.repetition / latency)
+    )
+
+
+def do_bench_cudagraph(
+    fn,
+    *,
+    rep=20,
+    return_mode="median",
+    grad_to_none=None,
+    replay_count=None,
+    warmup_replay_count=0,
+    rank_barrier=None,
+):
+    """Run the repository's common CUDA Graph benchmark path.
+
+    ``replay_count`` gives distributed collectives an identical replay count
+    on every rank. The default keeps Triton's duration-based behavior.
+    """
+    if replay_count is None:
+        return triton.testing.do_bench_cudagraph(
+            fn,
+            rep=rep,
+            return_mode=return_mode,
+            grad_to_none=grad_to_none,
+        )
+    if replay_count < 1 or warmup_replay_count < 0:
+        raise ValueError(
+            "replay_count must be positive and warmup_replay_count nonnegative"
+        )
+    if grad_to_none is not None:
+        raise ValueError("fixed CUDA Graph replay does not support gradients")
+    if return_mode != "mean":
+        raise ValueError("fixed CUDA Graph replay reports mean latency")
+
+    fn()
+    torch_device_fn.synchronize()
+    if rank_barrier is not None:
+        rank_barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    torch_device_fn.synchronize()
+    if rank_barrier is not None:
+        rank_barrier()
+
+    for _ in range(warmup_replay_count):
+        graph.replay()
+    torch_device_fn.synchronize()
+    if rank_barrier is not None:
+        rank_barrier()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(replay_count):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    latency = start.elapsed_time(end) / replay_count
+    if rank_barrier is not None:
+        rank_barrier()
+    graph.reset()
+    return latency
 
 
 class Benchmark:
@@ -82,6 +183,13 @@ class Benchmark:
         self.is_backward = is_backward
         self.is_inplace = is_inplace
         self._input_iter = None
+        # Baseline sub-entry for kanban operators that merge several precisions.
+        self.base_variant = None
+        # Precision used when picking the hardware scaling factor for the
+        # "vs Base" column. None means "same as the benchmarked io dtype";
+        # ops whose kernels compute in another precision (e.g. INT8 transport
+        # of FP8 weights) set this to that compute dtype.
+        self.scaling_dtype = None
 
         # Theoretical supported dtypes, metrics for the operation.
         # These are set by default.
@@ -271,33 +379,51 @@ class Benchmark:
                 (out,), xs, grad_outputs=(dout,), retain_graph=True
             )
         if Config.mode == consts.BenchMode.OPERATOR:
-            for i in range(Config.warm_up):
+            n_warm, n_rep = get_iter_count(fn)
+            for i in range(n_warm):
                 fn()
             torch_device_fn.synchronize()
             start = time.time()
-            for i in range(Config.repetition):
+            for i in range(n_rep):
                 fn()
             torch_device_fn.synchronize()
             end = time.time()
-            latency = (end - start) / Config.repetition * 1000
+            latency = (end - start) / n_rep * 1000
         elif Config.mode == consts.BenchMode.KERNEL:
-            do_bench = triton.testing.do_bench
-            latency = do_bench(
+            if vendor_name == "ascend":
+                do_bench = triton.backends.ascend.testing.do_bench_npu
+                latency = do_bench(
+                    fn,
+                    # do_bench_npu requires iterations, rather than duration
+                    # warmup=Config.warm_up,
+                    # active=Config.repetition,
+                )
+            else:
+                do_bench = triton.testing.do_bench
+                latency = do_bench(
+                    fn,
+                    warmup=Config.warm_up,
+                    rep=Config.repetition,
+                    return_mode="median",
+                    grad_to_none=xs if self.is_backward else None,
+                )
+        elif Config.mode == consts.BenchMode.WRAPPER:
+            n_warm, n_rep = get_iter_count(fn)
+            for i in range(n_warm):
+                fn()
+            torch_device_fn.synchronize()
+            start = time.time()
+            for i in range(n_rep):
+                fn()
+            end = time.time()
+            latency = (end - start) / n_rep * 1000
+        elif Config.mode == consts.BenchMode.CUDAGRAPH:
+            latency = do_bench_cudagraph(
                 fn,
-                warmup=Config.warm_up,
                 rep=Config.repetition,
                 return_mode="median",
                 grad_to_none=xs if self.is_backward else None,
             )
-        elif Config.mode == consts.BenchMode.WRAPPER:
-            for i in range(Config.warm_up):
-                fn()
-            torch_device_fn.synchronize()
-            start = time.time()
-            for i in range(Config.repetition):
-                fn()
-            end = time.time()
-            latency = (end - start) / Config.repetition * 1000
         else:
             raise ValueError("Undefined Value of Benchmark Mode.")
         # average latency in ms
@@ -391,10 +517,18 @@ class Benchmark:
                     pytest.fail(str(e))
 
                 metric = BenchmarkMetrics()
+                # Attach profiling time-share metadata when --model-profile
+                # was supplied.  The same metadata applies to every shape
+                # inside this op because it comes from op-level profiling.
+                if Config.model_profile and self.op_name in Config.model_profile:
+                    metric.time_share = Config.model_profile[self.op_name]
                 try:
                     args, kwargs = self.unpack_to_args_kwargs(input)
                     metric.shape_detail = self.record_shapes(*args, **kwargs)
-                    if "latency_base" in self.to_bench_metrics:
+                    if (
+                        "latency_base" in self.to_bench_metrics
+                        and self.torch_op is not None
+                    ):
                         metric.latency_base = self.get_latency(
                             self.torch_op, *args, **kwargs
                         )
@@ -404,20 +538,66 @@ class Benchmark:
                                 self.gems_op, *args, **kwargs
                             )
                         else:
-                            if self.op_name == "zero_":
-                                with flaggems_vllm.use_gems():
-                                    metric.latency = self.get_latency(
-                                        self.torch_op, *args, **kwargs
-                                    )
-                            else:
-                                # exclude flaggems' zero_ to avoid the overhead of zero_
-                                # in do_bench's clear_cache
-                                with flaggems_vllm.use_gems(exclude=["zero_"]):
-                                    metric.latency = self.get_latency(
-                                        self.torch_op, *args, **kwargs
-                                    )
-                    if "speedup" in self.to_bench_metrics:
+                            metric.latency = self.get_latency(
+                                self.torch_op, *args, **kwargs
+                            )
+                    if (
+                        "speedup" in self.to_bench_metrics
+                        and metric.latency_base is not None
+                        and metric.latency
+                    ):
                         metric.speedup = metric.latency_base / metric.latency
+                    if Config.base_data is not None and metric.latency:
+                        base_rec, miss_reason = lookup_base_record_ex(
+                            Config.base_data,
+                            self.op_name,
+                            dtype,
+                            metric.shape_detail,
+                            self.base_variant,
+                        )
+                        base_ms = base_rec.get("latency_ms") if base_rec else None
+                        if base_ms is not None:
+                            # Both baseline (latency_ms) and metric.latency are in
+                            # ms, so the raw ratio is dimensionless. Divide by this
+                            # chip's scaling factor for the baseline's bottleneck
+                            # resource (bandwidth for mem, compute peak for tensor
+                            # points, using the precision the kernels actually run
+                            # in when the op overrides scaling_dtype) to normalize
+                            # away the hardware peak gap; missing factor -> raw
+                            # ratio.
+                            speedup = base_ms / metric.latency
+                            factor = lookup_scaling_factor(
+                                Config.base_data,
+                                vendor_name,
+                                base_rec.get("bottle_neck_unit"),
+                                self.scaling_dtype or dtype,
+                            )
+                            if factor:
+                                speedup /= factor
+                            metric.compared_speedup = speedup
+                            print(
+                                f"[vs Base] {self.op_name} shape={metric.shape_detail} "
+                                f"base={base_ms:.6f}ms gems={metric.latency:.6f}ms "
+                                f"factor={factor} vs_base={speedup:.3f}"
+                            )
+                        else:
+                            # No baseline match: record and print the precise
+                            # reason (op / shape / dtype missing) so it can be
+                            # aggregated later.
+                            metric.base_miss_reason = miss_reason
+                            print(f"[vs Base][未匹配] {miss_reason}")
+                            # Method A hard error: when there is no on-machine
+                            # reference (torch_op is None, i.e. the vendor has no
+                            # native implementation) AND the NV baseline has no
+                            # matching record, there is no usable baseline at all
+                            # -> fail this case instead of silently yielding a
+                            # speedup/compared_speedup that are both None.
+                            if self.torch_op is None:
+                                raise RuntimeError(
+                                    f"no baseline available for '{self.op_name}'"
+                                    f" (dtype={dtype}): vendor-native missing and"
+                                    f" NV baseline unmatched ({miss_reason})"
+                                )
 
                     if "gbps" in self.to_bench_metrics:
                         metric.gbps_base = self.get_gbps(
@@ -425,7 +605,7 @@ class Benchmark:
                         )
                         metric.gbps = self.get_gbps(args, latency=metric.latency)
 
-                    if "tflops" in self.to_bench_metrics:
+                    if "tflops" in self.to_bench_metrics and self.torch_op is not None:
                         metric.tflops = (
                             self.get_tflops(self.torch_op, *args, **kwargs)
                             / metric.latency

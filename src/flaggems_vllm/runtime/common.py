@@ -32,6 +32,7 @@ class vendors(Enum):
     SPACEMIT = 13
     THEAD = 14
     ARM = 15
+    BIREN = 16
 
     @classmethod
     def get_all_vendors(cls) -> dict:
@@ -47,7 +48,37 @@ DEFAULT_STRATEGIES = {
     "baddbmm": ["align32", "align32", "align32"],
     "bmm": ["align32", "align32", "align32", "align32", "align32"],
     "bmm_sqmma": ["align32", "align32", "align32"],
-    "fused_marlin_moe_mxfp4": ["align32", "align32", "align32", "default"],
+    "compute_global_topk_indices_and_lens": ["align32", "align32"],
+    "fused_marlin_moe_w4a16_int4": [
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+        "default",
+        "default",
+    ],
+    "fused_marlin_moe_w4a16_int4_gemm_silu": [
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+        "default",
+        "default",
+        "default",
+    ],
+    "fused_marlin_moe_w4a16_mxfp4": [
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+        "default",
+    ],
+    "fused_marlin_moe_w4a16_mxfp4_gemm_silu": [
+        "align32",
+        "align32",
+        "align32",
+        "default",
+    ],
     "gemv": ["align32", "align32", "align32", "default"],
     "mm": ["align32", "align32", "align32", "align32", "align32"],
     "mm_sqmma": ["align32", "align32", "align32", "default"],
@@ -85,6 +116,58 @@ DEFAULT_STRATEGIES = {
         "default",
     ],
     "w8a8_block_fp8_bmm": ["default", "align32", "align32", "align32"],
+    "w8a8_block_fp8_bmm_general": [
+        "default",
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+    ],
+    "w8a8_block_fp8_bmm_splitk": [
+        "default",
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+    ],
+    "w8a8_block_fp8_matmul": ["align32", "align32", "align32", "align32", "align32"],
+    "w8a8_block_fp8_swap_ab": ["default", "default", "default", "default", "default"],
+    "w8a8_block_fp8_swap_ab_splitk": [
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+    ],
+    "w8a8_block_fp8_short_k256": [
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+    ],
+    "w8a8_block_int8_matmul": [
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+    ],
+    "w8a8_block_int8_swap": [
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+    ],
+    "w8a8_block_int8_gemv": ["default", "default"],
+    "w8a8_block_int8_general": ["default"] * 5,
+    "w8a8_block_int8_gemv_block": ["default"] * 4,
+    "w8a8_block_int8_splitk": ["default"] * 5,
     "mm_splitk": ["align32", "align32", "align32", "align32", "align32"],
 }
 
@@ -94,7 +177,37 @@ OP_KEY_ORDERS = {
     "bmm": ["M", "N", "K", "stride_am", "stride_bk"],
     "bmm_sqmma": ["M", "N", "K"],
     "baddbmm": ["M", "N", "K"],
-    "fused_marlin_moe_mxfp4": ["N", "K", "BLOCK_SIZE_M", "SWAP_AB"],
+    "compute_global_topk_indices_and_lens": ["topk", "num_tokens"],
+    "fused_marlin_moe_w4a16_int4": [
+        "N",
+        "K",
+        "EM",
+        "BLOCK_SIZE_M",
+        "MUL_ROUTED_WEIGHT",
+        "top_k",
+    ],
+    "fused_marlin_moe_w4a16_int4_gemm_silu": [
+        "N",
+        "K",
+        "EM",
+        "BLOCK_SIZE_M",
+        "APPLY_ROUTER_WEIGHT_BEFORE_SILU",
+        "APPLY_ROUTER_WEIGHT_AFTER_SILU",
+        "top_k",
+    ],
+    "fused_marlin_moe_w4a16_mxfp4": [
+        "N",
+        "K",
+        "EM_BUCKET",
+        "BLOCK_SIZE_M",
+        "SWAP_AB",
+    ],
+    "fused_marlin_moe_w4a16_mxfp4_gemm_silu": [
+        "N",
+        "K",
+        "BLOCK_SIZE_M",
+        "SWAP_AB",
+    ],
     "gemv": ["M", "K", "stride_am", "stride_bk"],
     "mm": ["M", "N", "K", "stride_am", "stride_bk"],
     "mm_sqmma": ["M", "N", "K", "dtype"],
@@ -106,6 +219,18 @@ OP_KEY_ORDERS = {
     "w8a8_block_fp8_general_splitk": ["M", "N", "K", "stride_am", "stride_bk"],
     "w8a8_block_fp8_general_tma": ["M", "N", "K", "stride_am", "stride_bk", "dtype"],
     "w8a8_block_fp8_bmm": ["B", "M_aligned", "N", "K"],
+    "w8a8_block_fp8_bmm_general": ["B", "M", "N", "K", "stride_xm", "stride_yk"],
+    "w8a8_block_fp8_bmm_splitk": ["B", "M", "N", "K", "stride_xm", "stride_yk"],
+    "w8a8_block_fp8_matmul": ["M", "N", "K", "stride_am", "stride_bk"],
+    "w8a8_block_fp8_swap_ab": ["M", "N", "K", "stride_am", "stride_bk"],
+    "w8a8_block_fp8_swap_ab_splitk": ["M", "N", "K", "stride_am", "stride_bk"],
+    "w8a8_block_fp8_short_k256": ["M", "N", "K", "stride_am", "stride_bk"],
+    "w8a8_block_int8_matmul": ["M", "N", "K", "GROUP_N", "GROUP_K", "SPLITS"],
+    "w8a8_block_int8_swap": ["M", "N", "K", "GROUP_N", "GROUP_K", "SPLITS"],
+    "w8a8_block_int8_gemv": ["N", "K"],
+    "w8a8_block_int8_general": ["M", "N", "K", "GROUP_N", "GROUP_K"],
+    "w8a8_block_int8_gemv_block": ["N", "K", "GROUP_N", "GROUP_K"],
+    "w8a8_block_int8_splitk": ["M", "N", "K", "GROUP_N", "GROUP_K"],
     "mm_splitk": ["M", "N", "K", "stride_am", "stride_bk"],
 }
 
@@ -119,6 +244,7 @@ _VENDOR_TORCH_ATTR = {
     "iluvatar": "corex",
     "mthreads": "musa",
     "sunrise": "ptpu",
+    "biren": "supa",
 }
 
 __all__ = [

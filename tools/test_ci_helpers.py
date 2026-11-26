@@ -24,7 +24,6 @@ import textwrap
 import unittest
 from pathlib import Path
 
-import check_ci_pins
 import run_ci_targets
 import select_backends
 import select_tests
@@ -125,7 +124,7 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
 class SelectBackendsTest(unittest.TestCase):
     registry = [
         {
-            "backend": "ascend-cann850",
+            "backend": "ascend-cann900",
             "runner_label": "ascend",
             "label": "vendor/Ascend",
             "gpu_check": "tools/gpu_check_ascend.sh",
@@ -149,17 +148,23 @@ class SelectBackendsTest(unittest.TestCase):
 
     def test_pr_label_selects_only_matching_backend(self):
         selected = select_backends.select_backends(
-            self.registry, {"vendor/Ascend"}, all_enabled=False
+            self.registry,
+            {"vendor/Ascend"},
+            all_enabled=False,
+            auto_selected_backends=set(),
         )
-        self.assertEqual([entry["backend"] for entry in selected], ["ascend-cann850"])
+        self.assertEqual([entry["backend"] for entry in selected], ["ascend-cann900"])
 
     def test_all_enabled_still_excludes_nvidia(self):
         selected = select_backends.select_backends(
-            self.registry, set(), all_enabled=True
+            self.registry,
+            set(),
+            all_enabled=True,
+            auto_selected_backends=set(),
         )
         self.assertEqual(
             [entry["backend"] for entry in selected],
-            ["ascend-cann850", "kunlunxin"],
+            ["ascend-cann900", "kunlunxin"],
         )
 
     def test_backend_source_change_selects_vendor_without_a_label(self):
@@ -168,11 +173,133 @@ class SelectBackendsTest(unittest.TestCase):
             set(),
             all_enabled=False,
             changed_files={"src/flaggems_vllm/runtime/backend/_kunlunxin/ops/mul.py"},
+            auto_selected_backends={"kunlunxin"},
         )
         self.assertEqual(
             [entry["backend"] for entry in selected],
             ["kunlunxin"],
         )
+
+    def test_path_inference_selects_only_preflight_verified_backends(self):
+        selected = select_backends.select_backends(
+            self.registry,
+            set(),
+            all_enabled=False,
+            changed_files={
+                "src/flaggems_vllm/runtime/backend/_ascend/ops/mul.py",
+                "src/flaggems_vllm/runtime/backend/_kunlunxin/ops/mul.py",
+            },
+            auto_selected_backends={"ascend-cann900"},
+        )
+        self.assertEqual(
+            [entry["backend"] for entry in selected],
+            ["ascend-cann900"],
+        )
+
+    def test_exact_label_overrides_automatic_selection_readiness(self):
+        selected = select_backends.select_backends(
+            self.registry,
+            {"vendor/Kunlunxin"},
+            all_enabled=False,
+            auto_selected_backends=set(),
+        )
+        self.assertEqual(
+            [entry["backend"] for entry in selected],
+            ["kunlunxin"],
+        )
+
+    def test_all_enabled_overrides_automatic_selection_readiness(self):
+        selected = select_backends.select_backends(
+            self.registry,
+            set(),
+            all_enabled=True,
+            auto_selected_backends=set(),
+        )
+        self.assertEqual(
+            [entry["backend"] for entry in selected],
+            ["ascend-cann900", "kunlunxin"],
+        )
+
+    def test_loads_auto_selected_backends_from_capabilities(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "capabilities.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "defaults": {"auto_select": False},
+                        "backends": {
+                            "ascend-cann900": {"auto_select": True},
+                            "kunlunxin": {},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                select_backends.load_auto_selected_backends(path),
+                {"ascend-cann900"},
+            )
+
+    def test_capabilities_must_default_to_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "capabilities.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "defaults": {"auto_select": True},
+                        "backends": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "must be false"):
+                select_backends.load_auto_selected_backends(path)
+
+    def test_capabilities_reject_non_boolean_backend_override(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "capabilities.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "defaults": {"auto_select": False},
+                        "backends": {"kunlunxin": {"auto_select": "yes"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "must be a boolean"):
+                select_backends.load_auto_selected_backends(path)
+
+    def test_unknown_auto_selected_backend_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "missing from registry"):
+            select_backends.select_backends(
+                self.registry,
+                set(),
+                all_enabled=False,
+                auto_selected_backends={"misspelled-backend"},
+            )
+
+    def test_explicit_selection_cannot_enable_disabled_or_nvidia_backends(self):
+        registry = [
+            {
+                "backend": "disabled-vendor",
+                "runner_label": "disabled",
+                "label": "vendor/Disabled",
+                "gpu_check": "",
+                "enabled": False,
+            },
+            self.registry[2],
+        ]
+        selected = select_backends.select_backends(
+            registry,
+            {"vendor/Disabled", "vendor/NVIDIA"},
+            all_enabled=True,
+            auto_selected_backends=set(),
+        )
+        self.assertEqual(selected, [])
 
     def test_unrelated_source_change_does_not_select_a_vendor(self):
         selected = select_backends.select_backends(
@@ -180,6 +307,7 @@ class SelectBackendsTest(unittest.TestCase):
             set(),
             all_enabled=False,
             changed_files={"src/flaggems_vllm/ops/mul.py"},
+            auto_selected_backends=set(),
         )
         self.assertEqual(selected, [])
 
@@ -283,9 +411,10 @@ class IluvatarForkSelectionIntegrationTest(TemporaryRepositoryTestCase):
 
         selected_backends = select_backends.select_backends(
             registry,
-            set(),
+            {"vendor/Iluvatar"},
             all_enabled=False,
             changed_files=set(changed_files),
+            auto_selected_backends=set(),
         )
         _, selected_tests, _ = select_tests.select_targets(
             self.repo_root, changed_files
@@ -295,7 +424,7 @@ class IluvatarForkSelectionIntegrationTest(TemporaryRepositoryTestCase):
             "iluvatar",
         )
         approved = run_ci_targets.apply_policy(
-            # Normal pull requests pass --no-benchmarks in basic-ci.yml.
+            # Normal pull requests pass --no-benchmarks in unittest.yaml.
             {"tests": selected_tests, "benchmarks": []},
             policy,
         )
@@ -309,12 +438,82 @@ class IluvatarForkSelectionIntegrationTest(TemporaryRepositoryTestCase):
         )
 
 
-class CiPinsTest(unittest.TestCase):
-    def test_three_flaggems_pins_are_identical(self):
+class BenchmarkWorkflowPolicyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
         repo_root = Path(__file__).resolve().parents[1]
-        pins = check_ci_pins.extract_pins(repo_root)
-        self.assertEqual(len(pins), 3)
-        self.assertEqual(len(set(pins)), 1)
+        cls.workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
+            encoding="utf-8"
+        )
+
+    def test_pull_requests_cannot_enable_benchmarks(self):
+        marker = "          RUN_BENCHMARKS: >-\n"
+        start = self.workflow.index(marker)
+        end = self.workflow.index("        run: |\n", start)
+        expression = " ".join(self.workflow[start:end].split())
+
+        self.assertEqual(
+            expression,
+            "RUN_BENCHMARKS: >- "
+            "${{ github.event_name == 'push' || "
+            "(github.event_name == 'workflow_dispatch' && "
+            "inputs.run_benchmarks == true) }}",
+        )
+
+    def test_disabled_benchmarks_are_removed_from_selected_targets(self):
+        self.assertIn(
+            'if [[ "${RUN_BENCHMARKS}" != "true" ]]; then\n'
+            "            args+=(--no-benchmarks)",
+            self.workflow,
+        )
+
+
+class NoFlagGemsSourceDependencyTest(unittest.TestCase):
+    """CI must not fetch or call anything from the FlagGems repository."""
+
+    def test_ci_files_do_not_reference_the_flaggems_repository(self):
+        import re
+
+        repo_root = Path(__file__).resolve().parents[1]
+        # `flagos-ai/FlagGems` not followed by `-vllm`.
+        pattern = re.compile(r"flagos-ai/FlagGems(?!-vllm)", re.IGNORECASE)
+        paths = [
+            *(repo_root / ".github/workflows").glob("*.y*ml"),
+            *(repo_root / ".github/actions").rglob("*.y*ml"),
+        ]
+        self.assertTrue(paths)
+        for path in paths:
+            with self.subTest(path=path.name):
+                self.assertIsNone(
+                    pattern.search(path.read_text(encoding="utf-8")),
+                    f"{path} references the FlagGems repository",
+                )
+
+    def test_container_backends_are_not_in_the_bare_runner_registry(self):
+        import yaml
+
+        repo_root = Path(__file__).resolve().parents[1]
+        registry = select_backends.load_registry(repo_root / ".github/backends.json")
+        platforms = yaml.safe_load(
+            (repo_root / ".github/configs/ci-backends.yaml").read_text(encoding="utf-8")
+        )["platforms"]
+        # The H20 bare host (nvidia-cuda133) is recorded for reference only;
+        # select_backends never routes NVIDIA entries.
+        containerized = {
+            entry["backend"]
+            for entry in platforms.values()
+            if not entry["backend"].startswith("nvidia")
+        }
+        bare = {entry["backend"] for entry in registry}
+        self.assertEqual(containerized & bare, set())
+
+    def test_backend_registry_is_local(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        registry = select_backends.load_registry(repo_root / ".github/backends.json")
+        capabilities = select_backends.load_auto_selected_backends(
+            repo_root / ".github/backend-capabilities.json"
+        )
+        self.assertTrue(capabilities <= {entry["backend"] for entry in registry})
 
 
 class BackendTuneConfigTest(unittest.TestCase):
@@ -349,8 +548,14 @@ class BackendTuneConfigTest(unittest.TestCase):
             {},
         )
 
-    def test_iluvatar_comment_only_tune_config_loads(self):
-        self.assertEqual(self.backend_utils.get_tune_config("iluvatar"), {})
+    def test_iluvatar_tune_config_loads(self):
+        import yaml
+
+        config_path = (
+            Path(self.backend_utils.__file__).parent / "_iluvatar/tune_configs.yaml"
+        )
+        expected = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        self.assertEqual(self.backend_utils.get_tune_config("iluvatar"), expected)
 
     def test_non_empty_tune_config_is_preserved(self):
         directory = self.write_config("mul:\n  BLOCK_SIZE: 128\n")
@@ -383,6 +588,8 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
         inherited_home_is_valid: bool = True,
         passwd_home_is_valid: bool = True,
         uv_overrides_are_invalid: bool = False,
+        uv_http_retries: str | None = None,
+        uv_http_timeout: str | None = None,
     ):
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
@@ -427,8 +634,14 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
             "XDG_DATA_HOME",
             "UV_CACHE_DIR",
             "UV_PYTHON_INSTALL_DIR",
+            "UV_HTTP_RETRIES",
+            "UV_HTTP_TIMEOUT",
         ):
             environment.pop(name, None)
+        if uv_http_retries is not None:
+            environment["UV_HTTP_RETRIES"] = uv_http_retries
+        if uv_http_timeout is not None:
+            environment["UV_HTTP_TIMEOUT"] = uv_http_timeout
         if uv_overrides_are_invalid:
             invalid_cache = root / "invalid-uv-cache"
             invalid_python = root / "invalid-uv-python"
@@ -465,12 +678,16 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
 
         expected = {
             "HOME": inherited_home,
-            "FLAGGEMS_DIR": workspace / ".ci/flaggems",
-            "FLAGGEMS_VENV": workspace / ".ci/flaggems/.venv",
+            "FLAGGEMS_VENV": workspace / ".venv",
         }
-        self.assertEqual(set(values), set(expected))
+        self.assertEqual(
+            set(values),
+            {*expected, "UV_HTTP_RETRIES", "UV_HTTP_TIMEOUT"},
+        )
         for name, path in expected.items():
             self.assertEqual(Path(values[name]), path)
+        self.assertEqual(values["UV_HTTP_RETRIES"], "5")
+        self.assertEqual(values["UV_HTTP_TIMEOUT"], "60")
         self.assertTrue((inherited_home / ".local/bin").is_dir())
         self.assertTrue((inherited_home / ".cache/uv").is_dir())
         self.assertTrue((inherited_home / ".local/share/uv/python").is_dir())
@@ -488,6 +705,25 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
             Path(values["UV_PYTHON_INSTALL_DIR"]),
             inherited_home / ".local/share/uv/python",
         )
+
+    def test_preserves_explicit_uv_http_settings(self):
+        result, values, *_ = self.run_helper(
+            "iluvatar",
+            uv_http_retries="7",
+            uv_http_timeout="90",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values["UV_HTTP_RETRIES"], "7")
+        self.assertEqual(values["UV_HTTP_TIMEOUT"], "90")
+
+    def test_rejects_invalid_uv_http_settings(self):
+        result, values, *_ = self.run_helper(
+            "iluvatar",
+            uv_http_retries="not-a-number",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Invalid UV_HTTP_RETRIES", result.stderr)
+        self.assertEqual(values, {})
 
     def test_uses_passwd_home_when_inherited_home_is_invalid(self):
         result, values, _, _, _, passwd_home = self.run_helper(
@@ -530,12 +766,11 @@ class SetupFlagGemsActionContractTest(unittest.TestCase):
 
     def test_uses_explicit_caller_checkout_and_vendor_venv_paths(self):
         self.assertIn("tools/prepare-flaggems-ci-env.sh", self.action)
-        self.assertIn('cd "${FLAGGEMS_DIR}"', self.action)
+        self.assertIn('bash tools/setup.sh "${BACKEND}"', self.action)
         self.assertIn('source "${FLAGGEMS_VENV}/bin/activate"', self.action)
-        self.assertIn('-e "${GITHUB_WORKSPACE}"', self.action)
-        self.assertIn('script="${FLAGGEMS_DIR}/${GPU_CHECK_SCRIPT}"', self.action)
-        self.assertIn('ln -s "${FLAGGEMS_VENV}" .venv', self.action)
-        self.assertNotIn("cd .ci/flaggems", self.action)
+        self.assertIn('script="${GITHUB_WORKSPACE:?}/${GPU_CHECK_SCRIPT}"', self.action)
+        self.assertNotIn("FLAGGEMS_DIR", self.action)
+        self.assertNotIn(".ci/flaggems", self.action)
 
     def test_backend_test_prefers_the_physical_vendor_venv(self):
         self.assertIn('VENV_PATH="${FLAGGEMS_VENV:-.venv}"', self.test_script)
@@ -560,9 +795,19 @@ class SetupFlagGemsActionContractTest(unittest.TestCase):
 
 
 class CiWorkflowPolicyTest(unittest.TestCase):
+    def test_backend_path_routing_uses_local_preflight_readiness(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "--capabilities .github/backend-capabilities.json",
+            workflow,
+        )
+
     def test_all_backend_fanout_requires_an_explicit_request(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         all_enabled = workflow.split("ALL_ENABLED: >-", maxsplit=1)[1].split(
@@ -575,43 +820,60 @@ class CiWorkflowPolicyTest(unittest.TestCase):
 
     def test_forks_are_allowed_only_on_the_non_nvidia_lane(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         author_guard = "github.event.pull_request.user.login != 'dependabot[bot]'"
         repository_guard = (
             "github.event.pull_request.head.repo.full_name == github.repository"
         )
-        nvidia_job = workflow.split("  nvidia-tests:", maxsplit=1)[1].split(
-            "  non-nvidia-tests:", maxsplit=1
+        nvidia_label_opt_in = (
+            "contains(fromJSON(needs.preprocess.outputs.labels), 'ci/nvidia')"
+        )
+        nvidia_job = workflow.split("  python-op:", maxsplit=1)[1].split(
+            "  backend-tests:", maxsplit=1
         )[0]
-        non_nvidia_job = workflow.split("  non-nvidia-tests:", maxsplit=1)[1].split(
-            "  multi-backend-summary:", maxsplit=1
+        non_nvidia_job = workflow.split("  backend-tests:", maxsplit=1)[1].split(
+            "  vendor-container-tests:", maxsplit=1
         )[0]
 
         self.assertIn(repository_guard, nvidia_job)
+        self.assertIn(nvidia_label_opt_in, nvidia_job)
         self.assertNotIn(repository_guard, non_nvidia_job)
+        self.assertNotIn("ci/nvidia", non_nvidia_job)
         self.assertIn(author_guard, nvidia_job)
         self.assertIn(author_guard, non_nvidia_job)
         self.assertNotIn("github.actor != 'dependabot[bot]'", workflow)
+
+    def test_labels_come_from_the_api_after_triage(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            workflow.index("id: wait-for-triage"), workflow.index("id: get-labels")
+        )
+        self.assertLess(
+            workflow.index("id: get-labels"), workflow.index("id: select-backends")
+        )
+        self.assertNotIn("github.event.pull_request.labels.*.name, '", workflow)
 
 
 class CiSummaryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
-        summary = workflow.split("  multi-backend-summary:", maxsplit=1)[1]
+        summary = workflow.split("  unittest-required:", maxsplit=1)[1]
         cls.script = textwrap.dedent(
             summary.split("        run: |\n", maxsplit=1)[1]
         ).strip()
 
     def run_summary(self, **overrides):
         values = {
-            "CODE_STYLE_RESULT": "success",
-            "SELECT_TARGETS_RESULT": "success",
+            "PREPROCESS_RESULT": "success",
             "NVIDIA_RESULT": "skipped",
             "NON_NVIDIA_RESULT": "skipped",
             "SHOULD_RUN": "false",
@@ -629,7 +891,7 @@ class CiSummaryTest(unittest.TestCase):
             check=False,
         )
 
-    def test_expected_accelerator_results_succeed(self):
+    def test_expected_results_succeed(self):
         cases = {
             "trusted_nvidia_only": {
                 "SHOULD_RUN": "true",
@@ -670,7 +932,7 @@ class CiSummaryTest(unittest.TestCase):
 
     def test_missing_or_unexpected_results_fail(self):
         cases = {
-            "preparation_failed": {"CODE_STYLE_RESULT": "failure"},
+            "preparation_failed": {"PREPROCESS_RESULT": "failure"},
             "expected_nvidia_skipped": {
                 "SHOULD_RUN": "true",
                 "NVIDIA_RESULT": "skipped",
@@ -682,6 +944,7 @@ class CiSummaryTest(unittest.TestCase):
                 "NON_NVIDIA_RESULT": "failure",
             },
             "unexpected_backend_run": {"NON_NVIDIA_RESULT": "success"},
+            "unexpected_nvidia_run": {"NVIDIA_RESULT": "success"},
         }
 
         for name, values in cases.items():

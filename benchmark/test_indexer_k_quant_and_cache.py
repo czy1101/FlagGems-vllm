@@ -12,136 +12,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import pytest
 import torch
-from packaging.version import InvalidVersion, Version
 
-from flaggems_vllm.ops import indexer_k_quant_and_cache
+import flaggems_vllm
+from baseline import indexer_k_quant_and_cache
 
 from . import base
 
-_TARGET_VLLM_VERSION = Version("0.20.2")
-_NEXT_VLLM_VERSION = Version("0.21.0")
 
+def _vendor_native():
+    if flaggems_vllm.vendor_name == "ascend":
+        return None
 
-def is_fp8e4nv_supported():
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return major + minor / 10 >= 8.9
-
-
-def run_vllm_benchmark(bench):
-    original_str = base.BenchmarkResult.__str__
-
-    def vllm_str(result):
-        return (
-            original_str(result)
-            .replace("Torch Latency (ms)", "vLLM CUDA Latency (ms)")
-            .replace("Torch GBPS ", "vLLM CUDA GBPS ")
-        )
-
-    base.BenchmarkResult.__str__ = vllm_str
     try:
-        bench.run()
-    finally:
-        base.BenchmarkResult.__str__ = original_str
+        import vllm._custom_ops  # noqa: F401 - registers the cache operators
 
+        op = torch.ops._C_cache_ops.indexer_k_quant_and_cache
+    except (ImportError, AttributeError, OSError, RuntimeError):
+        return None
 
-def load_vllm_cuda_op():
-    os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
-    if getattr(torch.version, "cuda", None) is None:
-        pytest.skip("vLLM CUDA custom op requires a CUDA PyTorch build")
-    vllm = pytest.importorskip("vllm")
-    version = getattr(vllm, "__version__", "0.0.0")
-    try:
-        parsed = Version(version.split("+", 1)[0])
-        if parsed < _TARGET_VLLM_VERSION or parsed >= _NEXT_VLLM_VERSION:
-            pytest.skip(
-                "indexer_k_quant_and_cache benchmark targets "
-                "vLLM CUDA >= 0.20.2 and < 0.21.0"
-            )
-    except InvalidVersion:
-        pass
-    try:
-        import vllm._custom_ops as ops
-    except Exception as exc:
-        pytest.skip(f"vLLM CUDA custom ops are unavailable: {exc}")
+    def native(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
+        return op(k, kv_cache, slot_mapping, quant_block_size, scale_fmt)
 
-    if not hasattr(ops, "indexer_k_quant_and_cache"):
-        pytest.skip("vLLM does not provide indexer_k_quant_and_cache")
-
-    def vllm_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
-        ops.indexer_k_quant_and_cache(
-            k,
-            kv_cache,
-            slot_mapping,
-            quant_block_size,
-            scale_fmt,
-        )
-
-    return vllm_indexer
+    return native
 
 
 class IndexerKQuantAndCacheBenchmark(base.Benchmark):
-    def __init__(self, vllm_op):
-        super().__init__(
-            op_name="indexer_k_quant_and_cache",
-            torch_op=vllm_op,
-            dtypes=[torch.float16, torch.bfloat16],
-        )
-        self.set_gems(indexer_k_quant_and_cache)
-        self.shape_desc = (
-            "num_tokens, num_blocks, block_size, head_dim, quant_block_size"
-        )
-
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
-            (128, 16, 16, 128, 128),
-            (512, 64, 16, 128, 128),
-            (1024, 128, 16, 512, 128),
-            (2048, 256, 16, 512, 128),
+            tuple(indexer_k_quant_and_cache.key_shape(binding))
+            for binding in indexer_k_quant_and_cache.grid()
         ]
+        self.shape_desc = ", ".join(indexer_k_quant_and_cache.SHAPE_FIELDS)
 
     def get_input_iter(self, dtype):
-        for (
-            num_tokens,
-            num_blocks,
-            block_size,
-            head_dim,
-            quant_block_size,
-        ) in self.shapes:
-            k = torch.randn(
-                num_tokens,
-                head_dim,
-                dtype=dtype,
-                device=self.device,
+        for shape in self.shapes:
+            binding = dict(zip(indexer_k_quant_and_cache.SHAPE_FIELDS, shape))
+            args, _ = indexer_k_quant_and_cache.build_inputs(
+                binding, dtype, self.device
             )
-            slot_mapping = torch.randperm(
-                num_blocks * block_size,
-                device=self.device,
-            )[
-                :num_tokens
-            ].to(torch.long)
-            cache_stride = head_dim + head_dim * 4 // quant_block_size
-            kv_cache = torch.empty(
-                num_blocks,
-                block_size,
-                cache_stride,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            yield k, kv_cache, slot_mapping, quant_block_size, {"scale_fmt": "ue8m0"}
+            # Benchmark.unpack_to_args_kwargs accepts string arguments by keyword.
+            k, cache, slots, quant_block_size, scale_fmt = args
+            yield k, cache, slots, quant_block_size, {"scale_fmt": scale_fmt}
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.skipif(
-    not is_fp8e4nv_supported(),
-    reason="fp8e4nv requires device capability >= 8.9",
-)
 @pytest.mark.indexer_k_quant_and_cache
 def test_indexer_k_quant_and_cache_benchmark():
-    bench = IndexerKQuantAndCacheBenchmark(load_vllm_cuda_op())
-    run_vllm_benchmark(bench)
+    bench = IndexerKQuantAndCacheBenchmark(
+        op_name=indexer_k_quant_and_cache.OP_NAME,
+        torch_op=_vendor_native(),
+        gems_op=flaggems_vllm.indexer_k_quant_and_cache,
+        dtypes=indexer_k_quant_and_cache.DTYPES,
+        is_inplace=indexer_k_quant_and_cache.IS_INPLACE,
+    )
+    bench.run()

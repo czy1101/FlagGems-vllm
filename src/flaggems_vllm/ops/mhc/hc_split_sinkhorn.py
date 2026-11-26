@@ -64,26 +64,10 @@ def mhc_split_sinkhorn_kernel_hcmult_4(
     tl.store(pre_ptr + pre_base + 3, tl.sigmoid(m3 * scale_0 + b3) + 1e-6, mask=mask)
 
     post_base = offs * 4
-    tl.store(
-        post_ptr + post_base + 0,
-        2.0 * tl.sigmoid(m4 * scale_1 + b4),
-        mask=mask,
-    )
-    tl.store(
-        post_ptr + post_base + 1,
-        2.0 * tl.sigmoid(m5 * scale_1 + b5),
-        mask=mask,
-    )
-    tl.store(
-        post_ptr + post_base + 2,
-        2.0 * tl.sigmoid(m6 * scale_1 + b6),
-        mask=mask,
-    )
-    tl.store(
-        post_ptr + post_base + 3,
-        2.0 * tl.sigmoid(m7 * scale_1 + b7),
-        mask=mask,
-    )
+    tl.store(post_ptr + post_base + 0, 2.0 * tl.sigmoid(m4 * scale_1 + b4), mask=mask)
+    tl.store(post_ptr + post_base + 1, 2.0 * tl.sigmoid(m5 * scale_1 + b5), mask=mask)
+    tl.store(post_ptr + post_base + 2, 2.0 * tl.sigmoid(m6 * scale_1 + b6), mask=mask)
+    tl.store(post_ptr + post_base + 3, 2.0 * tl.sigmoid(m7 * scale_1 + b7), mask=mask)
 
     cb = 8
     b8 = tl.load(hc_base_ptr + cb + 0)
@@ -282,10 +266,7 @@ def mhc_split_sinkhorn_kernel_generic(
         pre_b = tl.load(hc_base_ptr + pre_idx)
         post_b = tl.load(hc_base_ptr + post_idx)
         tl.store(pre_ptr + pre_base + j, tl.sigmoid(pre_m * scale_0 + pre_b) + 1e-6)
-        tl.store(
-            post_ptr + post_base + j,
-            2.0 * tl.sigmoid(post_m * scale_1 + post_b),
-        )
+        tl.store(post_ptr + post_base + j, 2.0 * tl.sigmoid(post_m * scale_1 + post_b))
 
     comb_offset = 2 * HC_MULT
 
@@ -360,7 +341,7 @@ def hc_split_sinkhorn(
     assert hc_scale.shape == (3,)
     assert hc_base.shape == (mix_hc,)
 
-    if mixes.device.type == "cuda" and eps == 1e-6 and hc_mult >= 1:
+    if eps == 1e-6 and hc_mult >= 1:
         outer_shape = mixes.shape[:-1]
         mixes_flat = mixes.reshape(-1, mix_hc).contiguous()
         num_tokens = mixes_flat.shape[0]
@@ -370,10 +351,7 @@ def hc_split_sinkhorn(
             num_tokens, hc_mult, dtype=torch.float32, device=mixes.device
         )
         comb = torch.empty(
-            num_tokens,
-            hc_mult * hc_mult,
-            dtype=torch.float32,
-            device=mixes.device,
+            num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=mixes.device
         )
 
         if num_tokens <= 256:
@@ -427,13 +405,9 @@ def hc_split_sinkhorn(
                 num_stages=1,
             )
     else:
-        return mhc_split_sinkhorn_torch_ref(
-            mixes,
-            hc_scale,
-            hc_base,
-            hc_mult=hc_mult,
-            sinkhorn_iters=sinkhorn_iters,
-            eps=eps,
+        raise NotImplementedError(
+            "hc_split_sinkhorn requires eps == 1e-6 and hc_mult >= 1, "
+            "got eps={}, hc_mult={}".format(eps, hc_mult)
         )
 
     return (
@@ -441,33 +415,3 @@ def hc_split_sinkhorn(
         post.view(*outer_shape, hc_mult),
         comb.view(*outer_shape, hc_mult, hc_mult),
     )
-
-
-def mhc_split_sinkhorn_torch_ref(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int = 4,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    outer_shape = mixes.shape[:-1]
-    mix_hc = (2 + hc_mult) * hc_mult
-    assert mixes.shape[-1] == mix_hc
-
-    pre = torch.sigmoid(mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
-    post = 2 * torch.sigmoid(
-        mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-    )
-    comb = mixes[..., 2 * hc_mult :].view(*outer_shape, hc_mult, hc_mult) * hc_scale[
-        2
-    ] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
-
-    row_max = comb.max(dim=-1, keepdim=True).values
-    comb = (comb - row_max).exp()
-    comb = comb / comb.sum(dim=-1, keepdim=True) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    return pre, post, comb

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+import os
 import random
 from math import ceil
 
@@ -19,10 +21,17 @@ import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.runtime import torch_device_fn
 
 from .conftest import QUICK_MODE
 
 random.seed(42)
+
+# Large production-like MoE shapes can allocate tens of GiB for weights alone.
+# Keep the default per-op run bounded; opt in explicitly for stress coverage.
+RUN_LARGE_MOE_TESTS = not QUICK_MODE and os.environ.get(
+    "FLAGGEMS_VLLM_RUN_LARGE_MOE_TESTS", "0"
+).lower() in {"1", "true", "yes", "on"}
 
 FUSED_MOE_CONFIGS = [
     # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
@@ -31,16 +40,16 @@ FUSED_MOE_CONFIGS = [
     (8, 4, 64, 128, 2),
     (16, 8, 256, 512, 2),
     (32, 8, 128, 256, 4),
+    (64, 8, 256, 512, 2),
+    (128, 16, 128, 256, 4),
+    (4, 16, 512, 1024, 2),
     # Qwen3.5 shapes (TP=4)
     (10, 256, 2048, 128, 8),
     (256, 256, 2048, 128, 8),
 ]
 
-if not QUICK_MODE:
+if RUN_LARGE_MOE_TESTS:
     FUSED_MOE_CONFIGS += [
-        (64, 8, 256, 512, 2),
-        (128, 16, 128, 256, 4),
-        (4, 16, 512, 1024, 2),
         # Mixtral-like shapes
         (1, 8, 4096, 14336, 2),
         (4, 8, 4096, 14336, 2),
@@ -65,12 +74,12 @@ FUSED_MOE_QUANT_CONFIGS = [
     (4, 8, 128, 256, 2),
     (16, 8, 256, 512, 2),
     (32, 8, 128, 256, 4),
+    (64, 8, 256, 512, 2),
+    (128, 16, 128, 256, 4),
 ]
 
-if not QUICK_MODE:
+if RUN_LARGE_MOE_TESTS:
     FUSED_MOE_QUANT_CONFIGS += [
-        (64, 8, 256, 512, 2),
-        (128, 16, 128, 256, 4),
         # Mixtral-like shapes
         (1, 8, 4096, 14336, 2),
         (16, 8, 4096, 14336, 2),
@@ -79,7 +88,7 @@ if not QUICK_MODE:
 
 FUSED_MOE_FP8_BLOCKWISE_CONFIGS = list(FUSED_MOE_QUANT_CONFIGS)
 
-if not QUICK_MODE:
+if RUN_LARGE_MOE_TESTS:
     FUSED_MOE_FP8_BLOCKWISE_CONFIGS += [
         # Qwen3.5-397B-A17B
         (1, 512, 4096, 1024, 10),
@@ -92,14 +101,49 @@ if not QUICK_MODE:
 
 
 def is_cuda_available():
-    if flaggems_vllm.device != "cuda":
+    if flaggems_vllm.device != "cuda" or not torch.cuda.is_available():
         return False
-    major, minor = torch.cuda.get_device_capability()
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return False
     sm_version_num = major * 10 + minor
     return sm_version_num >= 90 and sm_version_num < 100
 
 
 CUDA_AVAILABLE = is_cuda_available()
+
+
+# FP8 fused MoE tests run on NVIDIA Hopper (CUDA_AVAILABLE) or on any other
+# device whose actual capability supports FP8. The Hygon HCU is excluded by
+# platform property: it has no native FP8 MFMA (flagtree software-emulates
+# fp8 dot, ~10x slower than bf16), and its CUDA capability probe would
+# wrongly match the Hopper check. Other platforms are probed with a real
+# FP8 round-trip; any failure conservatively disables the FP8 tests.
+def _probe_fp8_support() -> bool:
+    if flaggems_vllm.vendor_name == "hygon":
+        return False  # Hygon HCU: no native FP8 compute, skip by platform
+    device = flaggems_vllm.device
+    if device == "cuda":
+        return False  # NVIDIA semantics stay with CUDA_AVAILABLE (Hopper)
+    try:
+        src = torch.ones(8, 8, device=device, dtype=torch.float32)
+        _ = src.to(torch.float8_e4m3fn).to(torch.float32)
+        return True
+    except Exception:
+        return False
+
+
+FP8_AVAILABLE = flaggems_vllm.vendor_name != "hygon" and (
+    CUDA_AVAILABLE or _probe_fp8_support()
+)
+
+
+def make_topk_routing(gating, topk, dtype):
+    """Build routing tensors using the production int32 expert-id contract."""
+    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights.to(dtype), topk_ids.to(torch.int32)
 
 
 def torch_fused_moe_reference(
@@ -172,9 +216,7 @@ def test_fused_moe_vs_ref(config, dtype):
 
     # Generate routing
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems result
     result = flaggems_vllm.ops_experts_impl(
@@ -188,10 +230,7 @@ def test_fused_moe_vs_ref(config, dtype):
     # Pure PyTorch reference (no vLLM dependency)
     ref = torch_fused_moe_reference(hidden_states, w1, w2, topk_weights, topk_ids)
 
-    if flaggems_vllm.vendor_name == "ascend":
-        torch.npu.synchronize()
-    else:
-        torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     # Fused bf16/fp16 kernels accumulate rounding errors across two GEMMs
     # and an activation; use tolerances proportional to output magnitude.
@@ -210,6 +249,29 @@ try:
 except ImportError:
     HAS_VLLM_FUSED_MOE = False
 
+# On the Hygon HCU backend vLLM's upstream fused_moe kernel (no HCU
+# adaptation) is unreliable for small-E shapes (E<256): it intermittently
+# segfaults (a process-killing crash that cannot be caught by try/except)
+# or produces wrong results, so those comparisons are skipped by platform
+# property rather than probed. E>=256 (Qwen/DeepSeek) is unaffected.
+VLLM_SMALL_E_CRASH = flaggems_vllm.vendor_name == "hygon"
+
+
+def _supports_keyword(op, keyword):
+    try:
+        parameters = inspect.signature(op).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
+    vllm_fused_experts_impl, "inplace"
+)
+
 
 @pytest.mark.fused_experts_impl
 @pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM is required")
@@ -218,6 +280,11 @@ except ImportError:
 def test_fused_moe_vs_vllm(config, dtype):
     """Test FlagGems fused_moe against a pure PyTorch reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
+    if VLLM_SMALL_E_CRASH and num_experts < 256:
+        pytest.skip(
+            "vLLM fused_moe segfaults/errs for small-E shapes on Hygon HCU "
+            "(upstream kernel, no HCU adaptation)"
+        )
     device = flaggems_vllm.device
 
     torch.manual_seed(0)
@@ -237,9 +304,7 @@ def test_fused_moe_vs_vllm(config, dtype):
 
     # Generate routing
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems result
     result = flaggems_vllm.ops_experts_impl(
@@ -247,16 +312,17 @@ def test_fused_moe_vs_vllm(config, dtype):
     )
 
     # Reference result
+    vllm_kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
     ref = vllm_fused_experts_impl(
         hidden_states,
         w1,
         w2,
         topk_weights,
         topk_ids,
-        inplace=False,
+        **vllm_kwargs,
     )
 
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     # Fused bf16/fp16 kernels accumulate rounding errors across two GEMMs
     # and an activation; use tolerances proportional to output magnitude.
@@ -269,8 +335,8 @@ def test_fused_moe_vs_vllm(config, dtype):
 @pytest.mark.fused_experts_impl
 @pytest.mark.parametrize("config", FUSED_MOE_QUANT_CONFIGS)
 @pytest.mark.skipif(
-    not CUDA_AVAILABLE,
-    reason="FP8 quantization requires NVIDIA Hopper architecture",
+    not FP8_AVAILABLE,
+    reason="FP8 quantization requires NVIDIA Hopper or an FP8-capable accelerator",
 )
 def test_accuracy_fused_moe_fp8(config):
     """Test FlagGems fused_moe with FP8 W8A8 quantization."""
@@ -329,9 +395,7 @@ def test_accuracy_fused_moe_fp8(config):
 
     # Generate routing
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems FP8 result
     result = flaggems_vllm.ops_experts_impl(
@@ -357,7 +421,7 @@ def test_accuracy_fused_moe_fp8(config):
         hidden_states, w1_deq, w2_deq, topk_weights, topk_ids, quant_mode="fp8"
     )
 
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     # FP8 quantization introduces more error than bf16, use wider tolerances.
     # Two quantized GEMMs + activation create cumulative rounding error.
@@ -371,8 +435,9 @@ def _fake_quantize_fp8(tensor: torch.Tensor):
     finfo = torch.finfo(torch.float8_e4m3fn)
     fp8_max = finfo.max
     eps = 1e-10
-    # Per-tensor quantization
-    amax = tensor.abs().amax().clamp(min=eps).float()
+    # Per-token quantization (matches the fused Triton quant path in
+    # flaggems_vllm.ops.fused_moe._fp8_quantize: one scale per row)
+    amax = tensor.abs().amax(dim=-1, keepdim=True).clamp(min=eps).float()
     scale = amax / fp8_max
     q = (tensor.float() / scale).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
     return q.float() * scale  # dequantized
@@ -570,8 +635,8 @@ def torch_w8a8_block_fp8_moe(
 @pytest.mark.parametrize("config", FUSED_MOE_FP8_BLOCKWISE_CONFIGS)
 @pytest.mark.parametrize("block_shape", [[128, 128]])
 @pytest.mark.skipif(
-    not CUDA_AVAILABLE,
-    reason="FP8 blockwise quantization requires NVIDIA Hopper architecture",
+    not FP8_AVAILABLE,
+    reason="FP8 blockwise quantization requires NVIDIA Hopper or an FP8-capable accelerator",
 )
 def test_fused_moe_fp8_blockwise(config, block_shape):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
@@ -624,9 +689,7 @@ def test_fused_moe_fp8_blockwise(config, block_shape):
     )
 
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     result = flaggems_vllm.ops_experts_impl(
         hidden_states,
@@ -651,7 +714,7 @@ def test_fused_moe_fp8_blockwise(config, block_shape):
         block_shape,
     )
 
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     rtol = 2e-1
     atol = max(5e-2, ref.abs().max().item() * 5e-2)
@@ -659,7 +722,19 @@ def test_fused_moe_fp8_blockwise(config, block_shape):
 
 
 @pytest.mark.fused_experts_impl
-@pytest.mark.parametrize("config", FUSED_MOE_QUANT_CONFIGS)
+@pytest.mark.parametrize(
+    "config",
+    FUSED_MOE_QUANT_CONFIGS
+    + (
+        [
+            (64, 128, 6144, 384, 4),
+            (1024, 128, 6144, 384, 4),
+            (8192, 128, 6144, 384, 4),
+        ]
+        if RUN_LARGE_MOE_TESTS
+        else []
+    ),
+)
 def test_fused_moe_int8(config):
     """Test FlagGems fused_moe with INT8 W8A8 per-channel quantization."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
@@ -703,9 +778,7 @@ def test_fused_moe_int8(config):
 
     # Generate routing
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems INT8 result
     result = flaggems_vllm.ops_experts_impl(
@@ -733,7 +806,7 @@ def test_fused_moe_int8(config):
         quant_mode="int8",
     )
 
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     # INT8 quantization introduces more error, use wider tolerances
     rtol = 2e-1
@@ -821,9 +894,7 @@ def test_fused_moe_int8_w8a16(config):
 
     # Generate routing
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems INT8 W8A16 result
     result = flaggems_vllm.ops_experts_impl(
@@ -849,7 +920,7 @@ def test_fused_moe_int8_w8a16(config):
         topk_ids,
     )
 
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     # Weight-only quantization has less error than W8A8 since activations
     # are full precision, but still has weight quantization rounding error.
@@ -902,9 +973,7 @@ def test_fused_moe_int4_w4a16(config):
 
     # Generate routing
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # FlagGems INT4 W4A16 result
     result = flaggems_vllm.ops_experts_impl(
@@ -930,7 +999,7 @@ def test_fused_moe_int4_w4a16(config):
         topk_ids,
     )
 
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     # INT4 has coarser quantization → wider tolerance
     rtol = 3e-1
@@ -967,9 +1036,7 @@ def test_fused_moe_inplace(config, dtype):
     ) * (1.0 / intermediate_size**0.5)
 
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # Non-inplace reference
     ref = flaggems_vllm.ops_experts_impl(
@@ -992,7 +1059,7 @@ def test_fused_moe_inplace(config, dtype):
         inplace=True,
     )
 
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     # Result should be the same tensor as input
     assert result.data_ptr() == hidden_copy.data_ptr(), "inplace should reuse input"
@@ -1028,9 +1095,7 @@ def test_fused_moe_apply_router_weight_on_input(config, dtype):
     ) * (1.0 / intermediate_size**0.5)
 
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
 
     # Default (weight on GEMM2 output)
     result_default = flaggems_vllm.ops_experts_impl(
@@ -1052,7 +1117,7 @@ def test_fused_moe_apply_router_weight_on_input(config, dtype):
         apply_router_weight_on_input=True,
     )
 
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     # Due to SiLU nonlinearity, these will differ, but both should be
     # close to the reference with weight on the respective path.
