@@ -104,9 +104,7 @@ def _bias_kernel(
                         tl.store(
                             row_ptr + stop_ids,
                             stop_values,
-                            # Enflame: `> -inf` / `< inf` are unordered here, so
-                            # both are true for NaN.  Use only the ordered
-                            # comparisons (==, <=, >=); see module docstring.
+                            # Avoid the observed GCU NaN behavior of the strict-comparison predicate.
                             mask
                             & (stop_values == stop_values)
                             & ~(
