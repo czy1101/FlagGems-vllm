@@ -1,6 +1,6 @@
-#Enflame override for apply_logit_bias
-#Work around the observed GCU NaN behavior in the generic finiteness check.
-#Only finite saved stop logits are restored; NaN and infinities stay masked.
+# Enflame override for apply_logit_bias
+# Work around the observed GCU NaN behavior in the generic finiteness check.
+# Only finite saved stop logits are restored; NaN and infinities stay masked.
 
 
 import torch
