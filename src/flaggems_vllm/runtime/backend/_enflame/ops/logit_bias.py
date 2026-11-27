@@ -1,25 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 FlagOS Contributors
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#Enflame override for apply_logit_bias
+#Work around the observed GCU NaN behavior in the generic finiteness check.
+#Only finite saved stop logits are restored; NaN and infinities stay masked.
 
-"""Enflame (GCU) variant of ``flaggems_vllm.ops.logit_bias``.
-
-Identical to the generic implementation except for the finiteness test that
-guards the "restore only finite stop logits" path.
-
-With the toolchain this backend ships (Triton 3.6.0, torch_gcu
-2.10.0+3.7.20260408), the two strict comparisons used by the generic predicate,
-``x > -inf`` and ``x < inf``, both evaluate to true for NaN, while ``==``,
-``<=`` and ``>=`` follow IEEE-754.  The generic predicate therefore admits a
-NaN stop logit, and the row keeps NaN instead of staying at ``-inf``.  The
-replacement below uses only the ordered comparisons, so on a backend whose
-comparisons are all IEEE-conforming it evaluates to the same truth table as the
-generic expression.
-
-Exposed as ``flaggems_vllm.apply_logit_bias`` through
-``runtime.replace_customized_ops``; the generic module is left untouched for
-the other vendors.
-"""
 
 import torch
 import triton
