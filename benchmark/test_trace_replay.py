@@ -14,19 +14,34 @@
 
 """Benchmark trace replay against the upstream vLLM Triton implementation."""
 
+from dataclasses import asdict
+
 import pytest
 import torch
 
+import flaggems_vllm
 from flaggems_vllm import apply_trace_tokens as flaggems_apply_trace_tokens
 
 from . import base
+from .conftest import Config, emit_record_logger, update_result
+from .consts import (
+    BenchmarkMetrics,
+    BenchmarkResult,
+    lookup_base_record_ex,
+    lookup_scaling_factor,
+)
+
+VLLM_REFERENCE_UNAVAILABLE_REASON = None
 
 try:
     from vllm.v1.worker.gpu.sample.trace_replay import (
         apply_trace_tokens as vllm_reference,
     )
-except (ImportError, OSError):
+except (ImportError, OSError) as exc:
     vllm_reference = None
+    VLLM_REFERENCE_UNAVAILABLE_REASON = (
+        "vLLM apply_trace_tokens reference unavailable: " f"{type(exc).__name__}: {exc}"
+    )
 
 
 class TraceReplayBenchmark(base.Benchmark):
@@ -72,6 +87,59 @@ class TraceReplayBenchmark(base.Benchmark):
                     candidate_sampled, reference_sampled, rtol=0, atol=0
                 )
             yield (sampled, *arguments)
+
+    def run(self):
+        if vllm_reference is not None or Config.query:
+            return super().run()
+
+        self.init_user_config()
+        # Preserve measured latency when the native vLLM baseline is unavailable.
+        for dtype in self.to_bench_dtypes:
+            metrics = []
+            for inputs in self.get_input_iter(dtype):
+                args, kwargs = self.unpack_to_args_kwargs(inputs)
+                metric = BenchmarkMetrics()
+                metric.shape_detail = self.record_shapes(*args, **kwargs)
+                if Config.model_profile and self.op_name in Config.model_profile:
+                    metric.time_share = Config.model_profile[self.op_name]
+                metric.latency = self.get_latency(self.gems_op, *args, **kwargs)
+                if Config.base_data is not None:
+                    record, reason = lookup_base_record_ex(
+                        Config.base_data,
+                        self.op_name,
+                        dtype,
+                        metric.shape_detail,
+                        self.base_variant,
+                    )
+                    base_ms = record.get("latency_ms") if record else None
+                    if base_ms is not None:
+                        factor = lookup_scaling_factor(
+                            Config.base_data,
+                            flaggems_vllm.vendor_name,
+                            record.get("bottle_neck_unit"),
+                            self.scaling_dtype or dtype,
+                        )
+                        metric.compared_speedup = base_ms / metric.latency
+                        if factor:
+                            metric.compared_speedup /= factor
+                    else:
+                        metric.base_miss_reason = reason
+                metrics.append(metric)
+
+            result = BenchmarkResult(
+                level=Config.bench_level.value,
+                op_name=self.op_name,
+                dtype=str(dtype),
+                mode=Config.mode.value,
+                result=metrics,
+            )
+            payload = asdict(result)
+            # optest uses this metadata to handle an absent native speedup.
+            payload["native_baseline_skip_reason"] = VLLM_REFERENCE_UNAVAILABLE_REASON
+            print(result)
+            print(VLLM_REFERENCE_UNAVAILABLE_REASON)
+            update_result(self.op_name, payload)
+            emit_record_logger(result.to_json())
 
 
 @pytest.mark.apply_trace_tokens

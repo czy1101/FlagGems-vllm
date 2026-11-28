@@ -9,20 +9,34 @@ The standard --warmup/--iter millisecond budgets apply to steady-state modes.
 """
 
 import statistics
+from dataclasses import asdict
 
 import pytest
 import torch
 
+import flaggems_vllm
 from benchmark import base, consts
-from benchmark.conftest import Config
+from benchmark.conftest import Config, emit_record_logger, update_result
+from benchmark.consts import (
+    BenchmarkMetrics,
+    BenchmarkResult,
+    lookup_base_record_ex,
+    lookup_scaling_factor,
+)
 from flaggems_vllm import apply_thinking_budget, runtime
+
+VLLM_REFERENCE_UNAVAILABLE_REASON = None
 
 try:
     from vllm.v1.worker.gpu.sample.thinking_budget import (
         apply_thinking_budget as vllm_reference,
     )
-except ImportError:
+except (ImportError, OSError) as exc:
     vllm_reference = None
+    VLLM_REFERENCE_UNAVAILABLE_REASON = (
+        "vLLM apply_thinking_budget reference unavailable: "
+        f"{type(exc).__name__}: {exc}"
+    )
 
 pytestmark = [
     pytest.mark.apply_thinking_budget,
@@ -63,6 +77,60 @@ class ThinkingBudgetBenchmark(base.Benchmark):
             dtypes=[torch.float32],
             is_inplace=True,
         )
+
+    def run(self):
+        if self.torch_op is not None or Config.query:
+            return super().run()
+
+        self.init_user_config()
+        # Preserve measured latency when the native vLLM baseline is unavailable.
+        for dtype in self.to_bench_dtypes:
+            metrics = []
+            for inputs in self.get_input_iter(dtype):
+                args, kwargs = self.unpack_to_args_kwargs(inputs)
+                metric = BenchmarkMetrics()
+                metric.shape_detail = self.record_shapes(*args, **kwargs)
+                if Config.model_profile and self.op_name in Config.model_profile:
+                    metric.time_share = Config.model_profile[self.op_name]
+                if "latency" in self.to_bench_metrics:
+                    metric.latency = self.get_latency(self.gems_op, *args, **kwargs)
+                if Config.base_data is not None and metric.latency:
+                    record, reason = lookup_base_record_ex(
+                        Config.base_data,
+                        self.op_name,
+                        dtype,
+                        metric.shape_detail,
+                        self.base_variant,
+                    )
+                    base_ms = record.get("latency_ms") if record else None
+                    if base_ms is not None:
+                        factor = lookup_scaling_factor(
+                            Config.base_data,
+                            flaggems_vllm.vendor_name,
+                            record.get("bottle_neck_unit"),
+                            self.scaling_dtype or dtype,
+                        )
+                        metric.compared_speedup = base_ms / metric.latency
+                        if factor:
+                            metric.compared_speedup /= factor
+                    else:
+                        metric.base_miss_reason = reason
+                metrics.append(metric)
+
+            result = BenchmarkResult(
+                level=Config.bench_level.value,
+                op_name=self.op_name,
+                dtype=str(dtype),
+                mode=Config.mode.value,
+                result=metrics,
+            )
+            payload = asdict(result)
+            # optest uses this metadata to handle an absent native speedup.
+            payload["native_baseline_skip_reason"] = VLLM_REFERENCE_UNAVAILABLE_REASON
+            print(result)
+            print(VLLM_REFERENCE_UNAVAILABLE_REASON)
+            update_result(self.op_name, payload)
+            emit_record_logger(result.to_json())
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = self.DEFAULT_SHAPES
